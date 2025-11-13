@@ -20,6 +20,8 @@ from scipy.cluster.hierarchy import fcluster
 from sklearn.neighbors import NearestNeighbors
 from helpers import to_safe_name
 
+INHERIT_REGEX = object()
+
 
 try:
     import pywt
@@ -28,22 +30,23 @@ except Exception:
     _PYWT_OK = False
 
 # import the registry + protocol from your dataset module
-from dataset import register_feature
-# features.py
-
-
-
-INHERIT_REGEX = "<<inherit>>"
-
 try:
-    # import helpers from dataset.py
-    from dataset import register_feature, _feature_run_root, _feature_index_path, \
-                        _latest_feature_run_root
+    from dataset import (
+        register_feature,
+        _feature_run_root,
+        _feature_index_path,
+        _latest_feature_run_root,
+        save_inputset,
+        _resolve_inputs,
+    )
 except Exception:
     def register_feature(cls): return cls
     def _latest_feature_run_root(ds, name): raise RuntimeError("Bind dataset first")
     def _feature_run_root(ds, name, run_id): raise RuntimeError("Bind dataset first")
     def _feature_index_path(ds, name): raise RuntimeError("Bind dataset first")
+    def save_inputset(*args, **kwargs): raise RuntimeError("Bind dataset first")
+    def _resolve_inputs(*args, **kwargs): raise RuntimeError("Bind dataset first")
+
 
 def _merge_params(overrides: Optional[Dict[str, Any]], defaults: Dict[str, Any]) -> Dict[str, Any]:
     if not overrides:
@@ -51,106 +54,6 @@ def _merge_params(overrides: Optional[Dict[str, Any]], defaults: Dict[str, Any])
     out = dict(defaults)
     out.update({k: v for k, v in overrides.items() if v is not None})
     return out
-
-
-INPUTSET_DIRNAME = "inputsets"
-
-
-def _dataset_base_dir(ds) -> Path:
-    """
-    Resolve the directory that holds dataset-level config (sibling to dataset manifest).
-    """
-    base = getattr(ds, "manifest_path", None)
-    if base is not None:
-        base = Path(base)
-        base = base.parent if base.is_file() else base
-    else:
-        # Fall back to features root parent
-        base = Path(ds.get_root("features")).parent
-    base.mkdir(parents=True, exist_ok=True)
-    return base
-
-
-def _inputset_dir(ds) -> Path:
-    base = _dataset_base_dir(ds)
-    path = base / INPUTSET_DIRNAME
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _inputset_path(ds, name: str) -> Path:
-    safe = to_safe_name(name)
-    if not safe:
-        raise ValueError("Inputset name must contain alphanumeric characters.")
-    return _inputset_dir(ds) / f"{safe}.json"
-
-
-def save_inputset(ds, name: str, inputs: list[dict], description: Optional[str] = None,
-                  overwrite: bool = False) -> Path:
-    """
-    Persist an inputset JSON under <dataset_root>/inputsets/<name>.json.
-    """
-    path = _inputset_path(ds, name)
-    if path.exists() and not overwrite:
-        raise FileExistsError(f"Inputset '{name}' already exists: {path}")
-    payload = {
-        "name": name,
-        "description": description or "",
-        "inputs": inputs or [],
-    }
-    path.write_text(json.dumps(payload, indent=2))
-    return path
-
-
-def _fingerprint_inputs(inputs: list[dict]) -> str:
-    serialized = json.dumps(inputs or [], sort_keys=True, default=str)
-    return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
-
-
-def _load_inputset(ds, name: str) -> tuple[list[dict], dict]:
-    path = _inputset_path(ds, name)
-    if not path.exists():
-        raise FileNotFoundError(f"Inputset '{name}' not found at {path}")
-    data = json.loads(path.read_text())
-    inputs = data.get("inputs") or []
-    fingerprint = _fingerprint_inputs(inputs)
-    meta = {
-        "inputset": name,
-        "inputs_fingerprint": fingerprint,
-        "inputs_source": "inputset",
-        "inputset_path": str(path),
-        "description": data.get("description", ""),
-    }
-    return inputs, meta
-
-
-def _resolve_inputs(ds, explicit_inputs: Optional[list[dict]], inputset_name: Optional[str],
-                    explicit_override: bool = False) -> tuple[list[dict], dict]:
-    """
-    Determine which inputs to use based on explicit params vs. named inputset.
-    If inputset_name is provided, it overrides defaults unless explicit_inputs was
-    explicitly supplied by the caller (explicit_override=True).
-    """
-    if inputset_name:
-        inputs, meta = _load_inputset(ds, inputset_name)
-        if explicit_inputs and explicit_override:
-            inputs = explicit_inputs
-            meta = {
-                "inputset": inputset_name,
-                "inputs_fingerprint": _fingerprint_inputs(inputs),
-                "inputs_source": "explicit",
-            }
-    else:
-        inputs = explicit_inputs or []
-        meta = {
-            "inputset": None,
-            "inputs_fingerprint": _fingerprint_inputs(inputs),
-            "inputs_source": "explicit" if explicit_inputs else "default",
-        }
-
-    if not inputs:
-        raise ValueError("No inputs resolved; provide params['inputs'] or params['inputset'].")
-    return inputs, meta
 
 
 def _load_array_from_spec(path: Path, load_spec: dict) -> Optional[np.ndarray]:
@@ -1155,6 +1058,10 @@ class GlobalTSNE:
                 },
             ],
             inputset=None,
+            map_existing_inputs=False,
+            reuse_embedding=None,
+            artifact=None,
+            scaler=None,
             random_state=42,
             r_scaler=200_000,          # cap for standardizer fit sample
             total_templates=2000,      # farthest-first target
@@ -1176,10 +1083,14 @@ class GlobalTSNE:
         self._seq_path_cache: Dict[Tuple[str, str], Dict[Path, str]] = {}
         self._inputs_meta: Dict[str, Any] = {}
         self._resolved_inputs: List[dict] = []
+        self._scope_filter: Optional[dict] = None
 
     # dataset hook
     def bind_dataset(self, ds) -> None:
         self._ds = ds
+
+    def set_scope_filter(self, scope: Optional[dict]) -> None:
+        self._scope_filter = scope or {}
 
     # ---- Feature protocol ----
     def needs_fit(self) -> bool: return True
@@ -1201,6 +1112,10 @@ class GlobalTSNE:
         self._inputs_meta = inputs_meta
         # key is safe_seq (derived from dataset index or filename)
         per_key_parts: Dict[str, List[np.ndarray]] = {}
+
+        allowed_safe = None
+        if self._scope_filter:
+            allowed_safe = set(self._scope_filter.get("safe_sequences") or [])
 
         for spec in inputs:
             feat_name = spec["feature"]
@@ -1233,6 +1148,8 @@ class GlobalTSNE:
 
             for pth in files:
                 key = parse_key(pth)
+                if allowed_safe is not None and key not in allowed_safe:
+                    continue
                 arr = self._load_matrix(pth, loader)
                 if arr is None or arr.size == 0:
                     continue
@@ -1258,6 +1175,14 @@ class GlobalTSNE:
         keys = list(features_per_key.keys())
         if not keys:
             raise RuntimeError("No combined feature frames after alignment.")
+
+        if bool(self.params.get("map_existing_inputs")):
+            self._prepare_reuse_artifacts()
+            mapped = self._map_sequences(features_per_key)
+            self._artifacts["mapped_coords"] = mapped
+            self._artifacts["keys"] = keys
+            self._artifacts["inputs_meta"] = inputs_meta
+            return
 
         # 2) Global standardizer
         r_scaler = int(self.params["r_scaler"])
@@ -1316,22 +1241,7 @@ class GlobalTSNE:
         self._embedding = emb
 
         # 5) Map all frames in chunks
-        CHUNK = int(self.params["map_chunk"])
-        Kp, Pp, It, Lr = int(self.params["partial_k"]), int(self.params["perplexity"]), int(self.params["partial_iters"]), float(self.params["partial_lr"])
-
-        def map_chunk(embedding: TSNEEmbedding, X_chunk_std: np.ndarray) -> np.ndarray:
-            part = embedding.prepare_partial(X_chunk_std, initialization="median", k=Kp, perplexity=Pp)
-            part = part.optimize(n_iter=It, learning_rate=Lr, exaggeration=2.0,
-                                 momentum=0.0, inplace=False, verbose=False)
-            return np.asarray(part)
-
-        mapped = {}
-        for key in keys:
-            X = features_per_key[key]
-            if X.shape[0] == 0: continue
-            Xs = scaler.transform(X)
-            blocks = [map_chunk(emb, Xs[i:i+CHUNK]) for i in range(0, Xs.shape[0], CHUNK)]
-            mapped[key] = np.vstack(blocks)
+        mapped = self._map_sequences(features_per_key)
 
         # hold artifacts for save_model
         self._artifacts["keys"] = keys
@@ -1387,6 +1297,127 @@ class GlobalTSNE:
         mapping = _build_path_sequence_map(self._ds, feature_name, run_id)
         self._seq_path_cache[key] = mapping
         return mapping
+
+    def _resolve_feature_run_root(self, feature_name: str, run_id: str | None) -> tuple[str, Path]:
+        if self._ds is None:
+            raise RuntimeError("GlobalTSNE requires dataset binding before resolving feature runs.")
+        if run_id is None:
+            run_id, run_root = _latest_feature_run_root(self._ds, feature_name)
+        else:
+            run_root = _feature_run_root(self._ds, feature_name, run_id)
+        return str(run_id), run_root
+
+    def _load_embedding_from_spec(self, spec: dict) -> tuple[Any, Any]:
+        feature = spec.get("feature")
+        if not feature:
+            raise ValueError("reuse_embedding spec requires 'feature'.")
+        resolved_run_id, run_root = self._resolve_feature_run_root(feature, spec.get("run_id"))
+        pattern = spec.get("pattern", "global_opentsne_embedding.joblib")
+        files = sorted(run_root.glob(pattern))
+        if not files:
+            raise FileNotFoundError(f"reuse_embedding: no files matching '{pattern}' in {run_root}")
+        bundle = joblib.load(files[0])
+        embedding = bundle.get("embedding")
+        scaler = bundle.get("scaler")
+        if embedding is None:
+            raise ValueError(f"reuse_embedding bundle missing 'embedding' object: {files[0]}")
+        self._artifacts.setdefault("reuse_sources", {})["embedding"] = {
+            "feature": feature,
+            "run_id": resolved_run_id,
+            "path": str(files[0]),
+        }
+        return embedding, scaler
+
+    def _load_scaler_from_spec(self, spec: dict):
+        feature = spec.get("feature")
+        if not feature:
+            raise ValueError("scaler spec requires 'feature'.")
+        resolved_run_id, run_root = self._resolve_feature_run_root(feature, spec.get("run_id"))
+        pattern = spec.get("pattern", "global_opentsne_embedding.joblib")
+        files = sorted(run_root.glob(pattern))
+        if not files:
+            raise FileNotFoundError(f"scaler spec: no files matching '{pattern}' in {run_root}")
+        obj = joblib.load(files[0])
+        key = spec.get("key")
+        scaler = obj if key is None else obj[key]
+        self._artifacts.setdefault("reuse_sources", {})["scaler"] = {
+            "feature": feature,
+            "run_id": resolved_run_id,
+            "path": str(files[0]),
+        }
+        return scaler
+
+    def _load_templates_from_spec(self, spec: dict) -> Optional[np.ndarray]:
+        feature = spec.get("feature")
+        if not feature:
+            raise ValueError("artifact spec requires 'feature'.")
+        resolved_run_id, run_root = self._resolve_feature_run_root(feature, spec.get("run_id"))
+        pattern = spec.get("pattern", "global_templates_features.npz")
+        files = sorted(run_root.glob(pattern))
+        if not files:
+            raise FileNotFoundError(f"artifact spec: no files matching '{pattern}' in {run_root}")
+        load_spec = spec.get("load", {"kind": "npz", "key": "templates", "transpose": False})
+        arr = _load_array_from_spec(files[0], load_spec)
+        if arr is None:
+            return None
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        self._artifacts.setdefault("reuse_sources", {})["templates"] = {
+            "feature": feature,
+            "run_id": resolved_run_id,
+            "path": str(files[0]),
+        }
+        return arr
+
+    def _prepare_reuse_artifacts(self) -> None:
+        emb_spec = self.params.get("reuse_embedding")
+        if not emb_spec:
+            raise ValueError("map_existing_inputs=True requires params['reuse_embedding'].")
+        embedding, scaler = self._load_embedding_from_spec(emb_spec)
+        self._embedding = embedding
+        self._scaler = scaler
+        scaler_override = self.params.get("scaler")
+        if scaler_override:
+            self._scaler = self._load_scaler_from_spec(scaler_override)
+        if self._scaler is None:
+            raise ValueError("Reusable embedding bundle missing scaler; provide params['scaler'].")
+        art_spec = self.params.get("artifact")
+        if art_spec:
+            templates = self._load_templates_from_spec(art_spec)
+            if templates is not None:
+                self._artifacts["templates"] = templates
+
+    def _map_sequences(self, features_per_key: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        if self._embedding is None or self._scaler is None:
+            raise RuntimeError("GlobalTSNE mapping requires both embedding and scaler.")
+        embedding = self._embedding
+        scaler = self._scaler
+        CHUNK = int(self.params["map_chunk"])
+        Kp = int(self.params["partial_k"])
+        Pp = int(self.params["perplexity"])
+        It = int(self.params["partial_iters"])
+        Lr = float(self.params["partial_lr"])
+
+        def map_chunk_block(X_chunk_std: np.ndarray) -> np.ndarray:
+            part = embedding.prepare_partial(X_chunk_std, initialization="median", k=Kp, perplexity=Pp)
+            part = part.optimize(
+                n_iter=It,
+                learning_rate=Lr,
+                exaggeration=2.0,
+                momentum=0.0,
+                inplace=False,
+                verbose=False,
+            )
+            return np.asarray(part)
+
+        mapped: dict[str, np.ndarray] = {}
+        for key, X in features_per_key.items():
+            if X.shape[0] == 0:
+                continue
+            Xs = scaler.transform(X)
+            blocks = [map_chunk_block(Xs[i:i + CHUNK]) for i in range(0, Xs.shape[0], CHUNK)]
+            mapped[key] = np.vstack(blocks) if blocks else np.empty((0, 2), dtype=np.float32)
+        return mapped
 
     # ------- loaders -------
     def _load_matrix(self, pth: Path, spec: dict) -> np.ndarray | None:
@@ -1539,6 +1570,7 @@ class GlobalKMeansClustering:
         assign_config = self.params.get("assign") or {}
         self._assign_inputs_override = "inputs" in assign_config
         self._assign_inputs_meta: Dict[str, Any] = {}
+        self._scope_constraints: Optional[dict[str, set[str]]] = None
 
     def _load_one_general(self, path: Path, spec: dict) -> np.ndarray:
         arr = _load_array_from_spec(path, spec)
@@ -1576,6 +1608,7 @@ class GlobalKMeansClustering:
         Returns dict[safe_seq] -> list[np.ndarray]
         """
         per_key_parts = {}
+        scope_active = bool(self._scope_constraints)
         for spec in inputs:
             feat_name = spec["feature"]
             run_id = spec.get("run_id")
@@ -1584,8 +1617,22 @@ class GlobalKMeansClustering:
             load_spec = spec.get("load", {"kind": "npz", "key": "spectrogram", "transpose": True})
             files = sorted(run_root.glob(pattern))
             seq_map = self._feature_seq_map(feat_name, resolved_run_id)
+            meta_map = self._feature_path_metadata(feat_name, resolved_run_id) if scope_active else {}
             for pth in files:
-                key = self._extract_key_from_path(pth, seq_map)
+                try:
+                    abs_path = pth.resolve()
+                except Exception:
+                    abs_path = pth
+                meta = meta_map.get(abs_path, {})
+                group_val = str(meta.get("group", "") or "")
+                seq_val = str(meta.get("sequence", "") or "")
+                safe_seq = str(meta.get("sequence_safe", "") or "")
+                if not safe_seq:
+                    safe_seq = self._extract_key_from_path(pth, seq_map)
+                safe_group = to_safe_name(group_val) if group_val else self._extract_safe_group_from_path(pth)
+                if not self._is_scope_allowed(group_val, seq_val, safe_seq, safe_group):
+                    continue
+                key = safe_seq
                 arr = self._load_one_general(pth, load_spec)
                 if arr is None or arr.size == 0:
                     continue
@@ -1593,6 +1640,109 @@ class GlobalKMeansClustering:
                     per_key_parts[key] = []
                 per_key_parts[key].append(arr)
         return per_key_parts
+
+    def set_scope_constraints(self, scope: Optional[dict]) -> None:
+        """
+        Capture dataset-level group/sequence filters so assignment can respect them.
+        """
+        if not scope:
+            self._scope_constraints = None
+            return
+
+        def _to_norm_set(values: Any) -> Optional[set[str]]:
+            if not values:
+                return None
+            out = {str(v) for v in values if isinstance(v, (str, int)) or v}
+            out = {v for v in out if v}
+            return out or None
+
+        groups = _to_norm_set(scope.get("groups"))
+        safe_groups = _to_norm_set(scope.get("safe_groups"))
+        if groups and not safe_groups:
+            safe_groups = {to_safe_name(g) for g in groups}
+
+        sequences = _to_norm_set(scope.get("sequences"))
+        safe_sequences = _to_norm_set(scope.get("safe_sequences"))
+        if sequences and not safe_sequences:
+            safe_sequences = {to_safe_name(s) for s in sequences}
+
+        scoped = {
+            k: v for k, v in {
+                "groups": groups,
+                "safe_groups": safe_groups,
+                "sequences": sequences,
+                "safe_sequences": safe_sequences,
+            }.items() if v
+        }
+        self._scope_constraints = scoped or None
+
+    def _feature_path_metadata(self, feature_name: str, run_id: str) -> dict[Path, dict[str, str]]:
+        """
+        Returns {abs_path -> {group, sequence, sequence_safe}} for a prior feature run.
+        """
+        mapping: dict[Path, dict[str, str]] = {}
+        if self._ds is None:
+            return mapping
+        try:
+            idx_path = _feature_index_path(self._ds, feature_name)
+        except Exception:
+            return mapping
+        if not idx_path.exists():
+            return mapping
+        try:
+            df = pd.read_csv(idx_path)
+        except Exception:
+            return mapping
+        df = df[df["run_id"].astype(str) == str(run_id)]
+        if df.empty:
+            return mapping
+        df["group"] = df["group"].fillna("").astype(str)
+        df["sequence"] = df["sequence"].fillna("").astype(str)
+        if "sequence_safe" not in df.columns:
+            df["sequence_safe"] = df["sequence"].apply(lambda v: to_safe_name(v) if v else "")
+
+        for _, row in df.iterrows():
+            abs_raw = row.get("abs_path")
+            if not isinstance(abs_raw, str) or not abs_raw:
+                continue
+            try:
+                abs_path = Path(abs_raw).resolve()
+            except Exception:
+                abs_path = Path(abs_raw)
+            mapping[abs_path] = {
+                "group": str(row.get("group", "") or ""),
+                "sequence": str(row.get("sequence", "") or ""),
+                "sequence_safe": str(row.get("sequence_safe", "") or ""),
+            }
+        return mapping
+
+    def _extract_safe_group_from_path(self, path: Path) -> str:
+        stem = path.stem
+        if "__" in stem:
+            return stem.split("__", 1)[0]
+        return ""
+
+    def _is_scope_allowed(self,
+                          group: str,
+                          sequence: str,
+                          safe_sequence: str,
+                          safe_group: Optional[str]) -> bool:
+        if not self._scope_constraints:
+            return True
+        scope = self._scope_constraints
+        group = group or ""
+        sequence = sequence or ""
+        safe_sequence = safe_sequence or ""
+        safe_group = safe_group or ""
+        if scope.get("groups") and group not in scope["groups"]:
+            return False
+        if scope.get("safe_groups") and safe_group not in scope["safe_groups"]:
+            return False
+        if scope.get("sequences") and sequence not in scope["sequences"]:
+            return False
+        if scope.get("safe_sequences") and safe_sequence not in scope["safe_sequences"]:
+            return False
+        return True
 
     def _load_scaler(self, spec: dict):
         """
@@ -2142,9 +2292,10 @@ class WardAssignClustering:
     scaler : optional dict
         Same contract as GlobalKMeans.assign.scaler (joblib w/ StandardScaler).
     inputs : list[dict]
-        Feature specs to concatenate per sequence. The FIRST entry must match the feature
-        passed to dataset.run_feature(... input_feature=...) so that its DataFrames stream
-        through transform(); remaining entries are loaded from disk per sequence.
+        Feature specs to concatenate per sequence. All inputs are loaded from disk
+        (typically resolved via an inputset) and aligned per sequence before assignment.
+        To retain real frame indices in the outputs, set `load.frame_column` (defaults
+        to "frame" when present) for at least one input.
     n_clusters : int
         Desired Ward cut.
     recalc : bool
@@ -2195,15 +2346,33 @@ class WardAssignClustering:
         self._assign_nn = None
         self._scaler = None
         self._inputs = []
-        self._input_run_ids: list[str] = []
-        self._input_seq_paths: list[dict[str, Path]] = []
-        self._sequence_label_store: dict[str, np.ndarray] = {}
-        self._written_sequences: set[str] = set()
+        self._sequence_label_store: dict[str, dict[str, Any]] = {}
+        self._allowed_safe_sequences: Optional[set[str]] = None
+        self._pair_map: dict[str, tuple[str, str]] = {}
+        self._scope_filter: Optional[dict] = None
         self._inputs_overridden = bool(params and "inputs" in params)
         self._inputs_meta: Dict[str, Any] = {}
 
     def bind_dataset(self, ds):
         self._ds = ds
+
+    def set_scope_filter(self, scope: Optional[dict]) -> None:
+        self._scope_filter = scope or {}
+        safe_sequences = scope.get("safe_sequences") if scope else None
+        if safe_sequences:
+            self._allowed_safe_sequences = {str(s) for s in safe_sequences}
+        else:
+            self._allowed_safe_sequences = None
+        pair_safe_map = scope.get("pair_safe_map") if scope else None
+        if pair_safe_map:
+            inv = {}
+            for pair, safe in pair_safe_map.items():
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    continue
+                inv[str(safe)] = (str(pair[0]), str(pair[1]))
+            self._pair_map = inv
+        else:
+            self._pair_map = {}
 
     def needs_fit(self): return True
     def supports_partial_fit(self): return False
@@ -2279,7 +2448,42 @@ class WardAssignClustering:
         key = spec.get("key")
         return obj if key is None else obj[key]
 
-    def _load_one_general(self, path: Path, spec: dict) -> np.ndarray:
+    def _feature_path_metadata(self, feature_name: str, run_id: str) -> dict[Path, dict[str, str]]:
+        mapping: dict[Path, dict[str, str]] = {}
+        if self._ds is None:
+            return mapping
+        idx_path = _feature_index_path(self._ds, feature_name)
+        if not idx_path.exists():
+            return mapping
+        try:
+            df = pd.read_csv(idx_path)
+        except Exception:
+            return mapping
+        df = df[df["run_id"].astype(str) == str(run_id)]
+        if df.empty:
+            return mapping
+        df["group"] = df["group"].fillna("").astype(str)
+        df["sequence"] = df["sequence"].fillna("").astype(str)
+        if "sequence_safe" not in df.columns:
+            df["sequence_safe"] = df["sequence"].apply(lambda v: to_safe_name(v) if v else "")
+
+        for _, row in df.iterrows():
+            abs_raw = row.get("abs_path")
+            if not isinstance(abs_raw, str) or not abs_raw:
+                continue
+            try:
+                abs_path = Path(abs_raw).resolve()
+            except Exception:
+                abs_path = Path(abs_raw)
+            mapping[abs_path] = {
+                "group": str(row.get("group", "") or ""),
+                "sequence": str(row.get("sequence", "") or ""),
+                "sequence_safe": str(row.get("sequence_safe", "") or ""),
+            }
+        return mapping
+
+    def _load_one_general(self, path: Path, spec: dict) -> tuple[np.ndarray, Optional[np.ndarray]]:
+        frame_vals: Optional[np.ndarray] = None
         kind = str(spec.get("kind", "parquet")).lower()
         if kind == "npz":
             key = spec.get("key")
@@ -2289,9 +2493,20 @@ class WardAssignClustering:
             A = np.asarray(npz[key])
             if A.ndim == 1:
                 A = A[None, :]
-            return A.astype(np.float32, copy=False)
+            return A.astype(np.float32, copy=False), None
         elif kind == "parquet":
             df = pd.read_parquet(path)
+            frame_col = spec.get("frame_column")
+            if frame_col is None:
+                frame_col = "frame"
+            if frame_col and frame_col in df.columns:
+                try:
+                    frame_vals = df[frame_col].to_numpy(dtype=np.int64, copy=False)
+                except Exception:
+                    frame_vals = df[frame_col].to_numpy(copy=False)
+                drop_frame = bool(spec.get("drop_frame_column", False))
+                if drop_frame and not (spec.get("columns") and frame_col in spec.get("columns", [])):
+                    df = df.drop(columns=[frame_col])
             drop_cols = spec.get("drop_columns")
             if drop_cols:
                 df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
@@ -2308,37 +2523,79 @@ class WardAssignClustering:
             arr = df.to_numpy(dtype=np.float32, copy=False)
             if spec.get("transpose"):
                 arr = arr.T
-            return arr
+            return arr, frame_vals
         else:
             raise ValueError(f"[ward-assign] Unknown load.kind='{kind}'")
-
-    def _df_to_matrix(self, df: pd.DataFrame, spec: dict) -> np.ndarray:
-        drop_cols = spec.get("drop_columns")
-        if drop_cols:
-            df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
-        cols = spec.get("columns")
-        if cols:
-            df_num = df[cols]
-        else:
-            if spec.get("numeric_only", True):
-                df_num = df.select_dtypes(include=[np.number])
-            else:
-                df_num = df.apply(pd.to_numeric, errors="coerce")
-        arr = df_num.to_numpy(dtype=np.float32, copy=False)
-        if spec.get("transpose"):
-            arr = arr.T
-        if arr.ndim == 1:
-            arr = arr[None, :]
-        return arr
 
     def _infer_sequence(self, df: pd.DataFrame) -> str:
         if "sequence" in df.columns and not df["sequence"].empty:
             val = str(df["sequence"].iloc[0])
             if val:
                 return val
-        if "group" in df.columns and "sequence" in df.columns:
-            return str(df["sequence"].iloc[0])
+        if "sequence_safe" in df.columns and not df["sequence_safe"].empty:
+            safe = str(df["sequence_safe"].iloc[0])
+            if safe:
+                pair = self._pair_map.get(safe)
+                return pair[1] if pair else safe
         raise ValueError("[ward-assign] Input DataFrame missing 'sequence' column.")
+
+    def _collect_sequence_inputs(self) -> dict[str, dict[str, Any]]:
+        if not self._inputs:
+            return {}
+        n_inputs = len(self._inputs)
+        per_seq: dict[str, dict[str, Any]] = {}
+        allowed_safe = set(self._allowed_safe_sequences or [])
+        enforce_scope = bool(allowed_safe)
+
+        for idx, spec in enumerate(self._inputs):
+            feat_name = spec["feature"]
+            run_id = spec.get("run_id")
+            resolved_run_id, run_root = self._resolve_feature_run_root(feat_name, run_id)
+            pattern = spec.get("pattern", "*.parquet")
+            files = sorted(run_root.glob(pattern))
+            if not files:
+                print(f"[ward-assign] WARN: no files for {feat_name} ({resolved_run_id}) pattern={pattern}", file=sys.stderr)
+                continue
+            seq_map = _build_path_sequence_map(self._ds, feat_name, resolved_run_id)
+            meta_map = self._feature_path_metadata(feat_name, resolved_run_id)
+            load_spec = spec.get("load", {"kind": "parquet", "transpose": False})
+            for pth in files:
+                try:
+                    abs_path = pth.resolve()
+                except Exception:
+                    abs_path = pth
+                safe_seq = seq_map.get(abs_path)
+                if not safe_seq:
+                    safe_seq = to_safe_name(pth.stem)
+                safe_seq = str(safe_seq)
+                if enforce_scope and safe_seq not in allowed_safe:
+                    continue
+                arr, frame_vals = self._load_one_general(pth, load_spec)
+                if arr is None or arr.size == 0:
+                    continue
+                entry = per_seq.setdefault(safe_seq, {
+                    "mats": [None] * n_inputs,
+                    "frames": None,
+                    "sequence": None,
+                    "group": None,
+                })
+                entry["mats"][idx] = arr
+                meta = meta_map.get(abs_path, {})
+                if entry["sequence"] is None:
+                    entry["sequence"] = meta.get("sequence") or self._pair_map.get(safe_seq, ("", safe_seq))[1]
+                if entry["group"] is None:
+                    entry["group"] = meta.get("group") or self._pair_map.get(safe_seq, ("", ""))[0]
+                if entry["frames"] is None and frame_vals is not None:
+                    entry["frames"] = frame_vals
+
+        clean = {}
+        for safe_seq, payload in per_seq.items():
+            mats = payload["mats"]
+            if any((m is None or m.size == 0) for m in mats):
+                print(f"[ward-assign] WARN: missing inputs for sequence '{safe_seq}', skipping.", file=sys.stderr)
+                continue
+            clean[safe_seq] = payload
+        return clean
 
     def fit(self, X_iter: Iterable[pd.DataFrame]) -> None:
         if self._ds is None:
@@ -2354,7 +2611,7 @@ class WardAssignClustering:
             explicit_override=self._inputs_overridden,
         )
 
-        self._written_sequences.clear()
+        self._sequence_label_store.clear()
 
         # Load Ward linkage
         ward_spec = self.params["ward_model"]
@@ -2386,73 +2643,51 @@ class WardAssignClustering:
         # optional scaler
         self._scaler = self._load_scaler(self.params.get("scaler"))
 
-        # Prebuild sequence -> path maps for inputs (for loading additional specs)
-        self._input_run_ids = []
-        self._input_seq_paths = []
-        for spec in self._inputs:
-            run_id, _ = self._resolve_feature_run_root(spec["feature"], spec.get("run_id"))
-            seq_map = _build_path_sequence_map(self._ds, spec["feature"], run_id)
-            inv = {}
-            for path, seq in seq_map.items():
-                inv[str(seq)] = path
-            self._input_run_ids.append(run_id)
-            self._input_seq_paths.append(inv)
+        seq_payloads = self._collect_sequence_inputs()
+        if not seq_payloads:
+            raise RuntimeError("[ward-assign] No usable inputs found for assignment.")
+
+        for safe_seq, payload in seq_payloads.items():
+            mats = payload["mats"]
+            lengths = [m.shape[0] for m in mats if m is not None]
+            if not lengths:
+                continue
+            T_min = min(lengths)
+            mats_trim = [m[:T_min] for m in mats]
+            X_full = np.hstack(mats_trim)
+            if self._scaler is not None:
+                if not hasattr(self._scaler, "transform"):
+                    raise ValueError("[ward-assign] scaler object missing transform().")
+                X_use = self._scaler.transform(X_full)
+            else:
+                X_use = X_full
+            idxs = self._assign_nn.kneighbors(X_use, return_distance=False)
+            labels = self._cluster_ids[idxs.ravel()]
+            frames = payload.get("frames")
+            if frames is None or len(frames) < T_min:
+                frames = np.arange(T_min, dtype=int)
+            else:
+                frames = frames[:T_min]
+            seq_name = payload.get("sequence") or self._pair_map.get(safe_seq, ("", safe_seq))[1]
+            self._sequence_label_store[safe_seq] = {
+                "sequence": seq_name,
+                "frames": frames.astype(int, copy=False),
+                "labels": labels.astype(int, copy=False),
+            }
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        if not self._inputs:
+        if not self._sequence_label_store:
             return pd.DataFrame(index=[])
         seq = self._infer_sequence(df)
         safe_seq = to_safe_name(seq)
-        if safe_seq in self._written_sequences:
+        bundle = self._sequence_label_store.get(safe_seq)
+        if not bundle:
             return pd.DataFrame(index=[])
-        mats = []
-
-        for idx, spec in enumerate(self._inputs):
-            if idx == 0:
-                mats.append(self._df_to_matrix(df, spec.get("load", {})))
-            else:
-                seq_map = self._input_seq_paths[idx]
-                path = seq_map.get(safe_seq)
-                if not path:
-                    print(f"[ward-assign] WARN: missing feature '{spec['feature']}' for sequence {seq}", file=sys.stderr)
-                    return pd.DataFrame(index=[])
-                mats.append(self._load_one_general(Path(path), spec.get("load", {})))
-
-        if not mats:
-            return pd.DataFrame(index=[])
-
-        lengths = [m.shape[0] for m in mats if m.size]
-        if not lengths:
-            return pd.DataFrame(index=[])
-        T_min = min(lengths)
-        mats = [m[:T_min] for m in mats]
-
-        X_full = np.hstack(mats)
-        if self._scaler is not None:
-            if not hasattr(self._scaler, "transform"):
-                raise ValueError("[ward-assign] scaler object missing transform().")
-            X_use = self._scaler.transform(X_full)
-        else:
-            X_use = X_full
-
-        if self._assign_nn is None or self._cluster_ids is None:
-            raise RuntimeError("[ward-assign] Model not fitted; call dataset.run_feature first.")
-
-        idxs = self._assign_nn.kneighbors(X_use, return_distance=False)
-        labels = self._cluster_ids[idxs.ravel()]
-
-        if "frame" in df.columns:
-            frame_vals = df["frame"].to_numpy()[:T_min]
-        else:
-            frame_vals = np.arange(T_min, dtype=int)
-
         out = pd.DataFrame({
-            "frame": frame_vals.astype(int, copy=False),
-            "cluster": labels.astype(int, copy=False),
+            "frame": bundle["frames"],
+            "cluster": bundle["labels"],
             "sequence": seq,
         })
-        self._sequence_label_store[safe_seq] = labels.astype(int, copy=False)
-        self._written_sequences.add(safe_seq)
         return out
 
     def save_model(self, path: Path) -> None:
@@ -2461,7 +2696,10 @@ class WardAssignClustering:
             "params": self.params,
             "n_clusters": int(self.params.get("n_clusters", 20)),
         }, path)
-        for safe_seq, labels in self._sequence_label_store.items():
+        for safe_seq, bundle in self._sequence_label_store.items():
+            labels = bundle.get("labels")
+            if labels is None:
+                continue
             np.savez_compressed(run_root / f"global_ward_labels_seq={safe_seq}.npz", labels=labels)
 
 

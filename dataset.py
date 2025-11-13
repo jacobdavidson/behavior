@@ -103,6 +103,29 @@ register_track_schema(TrackSchema(
     description="Minimal T-Rex-like per-frame, per-id tracks with centroid/pose columns."
 ))
 
+# --- Standardized label metadata ---
+BEHAVIOR_LABEL_MAP = {
+    0: "attack",
+    1: "investigation",
+    2: "mount",
+    3: "other_interaction",
+}
+
+LABEL_INDEX_COLUMNS = [
+    "kind",
+    "label_format",
+    "group",
+    "sequence",
+    "group_safe",
+    "sequence_safe",
+    "abs_path",
+    "source_abs_path",
+    "source_md5",
+    "n_frames",
+    "label_ids",
+    "label_names",
+]
+
 def _md5(path: Path, chunk=1<<20) -> str:
     h = hashlib.md5()
     with path.open('rb') as f:
@@ -118,6 +141,104 @@ try:
     _YAML_OK = True
 except Exception:
     _YAML_OK = False
+
+INPUTSET_DIRNAME = "inputsets"
+
+
+def _dataset_base_dir(ds) -> Path:
+    """
+    Resolve the directory that holds dataset-level config (sibling to dataset manifest).
+    """
+    base = getattr(ds, "manifest_path", None)
+    if base is not None:
+        base = Path(base)
+        base = base.parent if base.is_file() else base
+    else:
+        base = Path(ds.get_root("features")).parent
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _inputset_dir(ds) -> Path:
+    base = _dataset_base_dir(ds)
+    path = base / INPUTSET_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _inputset_path(ds, name: str) -> Path:
+    safe = to_safe_name(name)
+    if not safe:
+        raise ValueError("Inputset name must contain alphanumeric characters.")
+    return _inputset_dir(ds) / f"{safe}.json"
+
+
+def save_inputset(ds, name: str, inputs: list[dict], description: Optional[str] = None,
+                  overwrite: bool = False) -> Path:
+    """
+    Persist an inputset JSON under <dataset_root>/inputsets/<name>.json.
+    """
+    path = _inputset_path(ds, name)
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"Inputset '{name}' already exists: {path}")
+    payload = {
+        "name": name,
+        "description": description or "",
+        "inputs": inputs or [],
+    }
+    path.write_text(json.dumps(payload, indent=2))
+    return path
+
+
+def _fingerprint_inputs(inputs: list[dict]) -> str:
+    serialized = json.dumps(inputs or [], sort_keys=True, default=str)
+    return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
+
+
+def _load_inputset(ds, name: str) -> tuple[list[dict], dict]:
+    path = _inputset_path(ds, name)
+    if not path.exists():
+        raise FileNotFoundError(f"Inputset '{name}' not found at {path}")
+    data = json.loads(path.read_text())
+    inputs = data.get("inputs") or []
+    fingerprint = _fingerprint_inputs(inputs)
+    meta = {
+        "inputset": name,
+        "inputs_fingerprint": fingerprint,
+        "inputs_source": "inputset",
+        "inputset_path": str(path),
+        "description": data.get("description", ""),
+    }
+    return inputs, meta
+
+
+def _resolve_inputs(ds, explicit_inputs: Optional[list[dict]], inputset_name: Optional[str],
+                    explicit_override: bool = False) -> tuple[list[dict], dict]:
+    """
+    Determine which inputs to use based on explicit params vs. named inputset.
+    If inputset_name is provided, it overrides defaults unless explicit_inputs was
+    explicitly supplied by the caller (explicit_override=True).
+    """
+    if inputset_name:
+        inputs, meta = _load_inputset(ds, inputset_name)
+        if explicit_inputs and explicit_override:
+            inputs = explicit_inputs
+            meta = {
+                "inputset": inputset_name,
+                "inputs_fingerprint": _fingerprint_inputs(inputs),
+                "inputs_source": "explicit",
+            }
+    else:
+        inputs = explicit_inputs or []
+        meta = {
+            "inputset": None,
+            "inputs_fingerprint": _fingerprint_inputs(inputs),
+            "inputs_source": "explicit" if explicit_inputs else "default",
+        }
+
+    if not inputs:
+        raise ValueError("No inputs resolved; provide params['inputs'] or params['inputset'].")
+    return inputs, meta
 
 
 ############# DATASET
@@ -757,6 +878,137 @@ class Dataset:
             self._write_tracks_index_row(row_out)
 
     # ----------------------------
+    # Labels: conversion + indexing
+    # ----------------------------
+    def convert_all_labels(self,
+                           kind: str = "behavior",
+                           overwrite: bool = False,
+                           params: Optional[dict] = None,
+                           source_format: Optional[str] = None) -> None:
+        """
+        Convert behavioral labels from raw CalMS21 files into per-sequence npz bundles under labels/<kind>.
+        """
+        params = params or {}
+        kind = str(kind or "").lower()
+        if kind != "behavior":
+            raise ValueError(f"Unsupported label kind '{kind}'. Only 'behavior' implemented.")
+
+        src_format = source_format or params.get("source_format") or "calms21_npy"
+        raw_idx = self.get_root("tracks_raw") / "index.csv"
+        if not raw_idx.exists():
+            raise FileNotFoundError("tracks_raw/index.csv not found; run index_tracks_raw first.")
+        df_raw = pd.read_csv(raw_idx)
+        if "src_format" not in df_raw.columns:
+            raise ValueError("tracks_raw/index.csv missing 'src_format' column.")
+        df_raw = df_raw[df_raw["src_format"].astype(str) == str(src_format)]
+        if df_raw.empty:
+            raise ValueError(f"No rows in tracks_raw/index.csv with src_format='{src_format}'.")
+
+        labels_root = self.get_root("labels") / kind
+        labels_root.mkdir(parents=True, exist_ok=True)
+        idx_path = labels_root / "index.csv"
+        if not idx_path.exists():
+            _ensure_labels_index(idx_path)
+
+        existing_pairs: set[tuple[str, str]] = set()
+        if idx_path.exists():
+            df_idx = pd.read_csv(idx_path)
+            if not df_idx.empty:
+                grouped = df_idx.get("group", pd.Series(dtype=str)).fillna("")
+                seqs = df_idx.get("sequence", pd.Series(dtype=str)).fillna("")
+                existing_pairs = set(zip(grouped.astype(str), seqs.astype(str)))
+
+        new_rows: list[dict] = []
+        total_sequences = 0
+        for _, raw_row in df_raw.iterrows():
+            created = self._convert_calms21_behavior_labels(
+                raw_row,
+                labels_root,
+                overwrite=overwrite,
+                existing_pairs=existing_pairs,
+            )
+            if created:
+                new_rows.extend(created)
+                total_sequences += len(created)
+
+        if new_rows:
+            _append_labels_index(idx_path, new_rows)
+            labels_meta = self.meta.setdefault("labels", {})
+            labels_meta["behavior"] = {
+                "index": str(idx_path.resolve()),
+                "label_format": "calms21_behavior_v1",
+                "label_ids": list(BEHAVIOR_LABEL_MAP.keys()),
+                "label_names": list(BEHAVIOR_LABEL_MAP.values()),
+                "updated_at": _now_iso(),
+            }
+            try:
+                self.save()
+            except Exception:
+                pass
+        print(f"[convert_all_labels] kind={kind} wrote {len(new_rows)} sequences (overwrite={overwrite}).")
+
+    def _convert_calms21_behavior_labels(self,
+                                         raw_row: pd.Series,
+                                         labels_root: Path,
+                                         overwrite: bool,
+                                         existing_pairs: set[tuple[str, str]]) -> list[dict]:
+        """
+        Convert one CalMS21 npy/json row into per-sequence behavior label npz files.
+        """
+        src_path = Path(raw_row["abs_path"])
+        nested = load_calms21(src_path)
+        rows_out: list[dict] = []
+        label_ids = np.array(list(BEHAVIOR_LABEL_MAP.keys()), dtype=int)
+        label_names = np.array(list(BEHAVIOR_LABEL_MAP.values()), dtype=object)
+
+        for group_name, seqs in nested.items():
+            group_val = str(group_name or "")
+            for seq_key, seq_dict in seqs.items():
+                if "annotations" not in seq_dict:
+                    continue
+                labels = np.asarray(seq_dict["annotations"])
+                if labels.ndim > 1:
+                    labels = labels[:, 0]
+                labels = labels.astype(int, copy=False)
+                frames = np.arange(labels.shape[0], dtype=np.int32)
+                seq_val = str(seq_key)
+                pair = (group_val, seq_val)
+                safe_group = to_safe_name(group_val) if group_val else ""
+                safe_seq = to_safe_name(seq_val)
+                fname = f"{safe_group + '__' if safe_group else ''}{safe_seq}.npz"
+                out_path = labels_root / fname
+
+                if not overwrite and pair in existing_pairs and out_path.exists():
+                    continue
+
+                payload = {
+                    "group": group_val,
+                    "sequence": seq_val,
+                    "sequence_key": seq_val,
+                    "frames": frames,
+                    "labels": labels,
+                    "label_ids": label_ids,
+                    "label_names": label_names,
+                }
+                np.savez_compressed(out_path, **payload)
+                existing_pairs.add(pair)
+                rows_out.append({
+                    "kind": "behavior",
+                    "label_format": "calms21_behavior_v1",
+                    "group": group_val,
+                    "sequence": seq_val,
+                    "group_safe": safe_group,
+                    "sequence_safe": safe_seq,
+                    "abs_path": str(out_path.resolve()),
+                    "source_abs_path": str(src_path.resolve()),
+                    "source_md5": raw_row.get("md5", ""),
+                    "n_frames": int(labels.shape[0]),
+                    "label_ids": ",".join(map(str, BEHAVIOR_LABEL_MAP.keys())),
+                    "label_names": ",".join(BEHAVIOR_LABEL_MAP.values()),
+                })
+        return rows_out
+
+    # ----------------------------
     # Load tracks (by group/sequence)
     # ----------------------------
     def load_tracks(self,
@@ -1277,7 +1529,8 @@ def _hash_params(d: dict) -> str:
 # ----------------------------
 def _yield_sequences(ds: "Dataset",
                      groups: Optional[Iterable[str]] = None,
-                     sequences: Optional[Iterable[str]] = None):
+                     sequences: Optional[Iterable[str]] = None,
+                     allowed_pairs: Optional[set[tuple[str, str]]] = None):
     """
     Yield (group, sequence, df) for standardized tracks present in tracks/index.csv,
     filtered by groups and/or sequences if provided.
@@ -1296,9 +1549,14 @@ def _yield_sequences(ds: "Dataset",
     if sequences is not None:
         sequences = {s for s in sequences}
         mask &= df_idx["sequence"].isin(sequences)
+    if allowed_pairs:
+        allowed_groups = {g for g, _ in allowed_pairs}
+        mask &= df_idx["group"].isin(allowed_groups)
 
     for _, row in df_idx[mask].iterrows():
         g, s = str(row["group"]), str(row["sequence"])
+        if allowed_pairs and (g, s) not in allowed_pairs:
+            continue
         p = Path(row["abs_path"])
         if not p.exists():
             print(f"[feature] missing parquet for ({g},{s}) -> {p}", file=sys.stderr)
@@ -1389,6 +1647,119 @@ def _feature_run_root(ds: "Dataset", feature_name: str, run_id: str) -> Path:
 def _feature_index_path(ds: "Dataset", feature_name: str) -> Path:
     return ds.get_root("features") / feature_name / "index.csv"
 
+
+def _resolve_inputset_scope(ds: "Dataset",
+                            inputset_name: str,
+                            groups: Optional[Iterable[str]] = None,
+                            sequences: Optional[Iterable[str]] = None) -> dict:
+    inputs, meta = _load_inputset(ds, inputset_name)
+    if not inputs:
+        raise ValueError(f"Inputset '{inputset_name}' has no inputs defined.")
+
+    groups_set = set(groups) if groups is not None else None
+    seq_set = set(sequences) if sequences is not None else None
+
+    per_feature_pairs: list[set[tuple[str, str]]] = []
+    pair_safe_map: dict[tuple[str, str], str] = {}
+    resolved_inputs: list[dict] = []
+
+    for spec in inputs:
+        feat_name = spec.get("feature")
+        if not feat_name:
+            continue
+        run_id = spec.get("run_id")
+        if run_id is None:
+            try:
+                run_id, _ = _latest_feature_run_root(ds, feat_name)
+            except Exception as exc:
+                raise RuntimeError(f"Unable to resolve latest run for feature '{feat_name}': {exc}") from exc
+        else:
+            run_root = _feature_run_root(ds, feat_name, run_id)
+            if not run_root.exists():
+                raise FileNotFoundError(f"Feature '{feat_name}' run '{run_id}' not found at {run_root}")
+
+        idx_path = _feature_index_path(ds, feat_name)
+        if not idx_path.exists():
+            raise FileNotFoundError(f"Feature '{feat_name}' has no index at {idx_path}")
+        df = pd.read_csv(idx_path)
+        df = df[df["run_id"].astype(str) == str(run_id)]
+        if df.empty:
+            print(f"[inputset:{inputset_name}] WARN: feature '{feat_name}' run '{run_id}' has no indexed rows.", file=sys.stderr)
+            per_feature_pairs.append(set())
+            resolved_inputs.append({"feature": feat_name, "run_id": run_id})
+            continue
+        df["group"] = df["group"].fillna("").astype(str)
+        df["sequence"] = df["sequence"].fillna("").astype(str)
+        if "sequence_safe" not in df.columns:
+            df["sequence_safe"] = df["sequence"].apply(lambda v: to_safe_name(v) if v else "")
+
+        # drop marker/global rows
+        df = df[df["sequence"].str.strip() != ""]
+        df = df[df["sequence"] != "__global__"]
+
+        avail_groups = set(df["group"])
+        avail_sequences = set(df["sequence"])
+
+        if groups_set:
+            missing_groups = sorted(groups_set - avail_groups)
+            if missing_groups:
+                print(f"[inputset:{inputset_name}] WARN: feature '{feat_name}' run '{run_id}' missing requested groups {missing_groups}; continuing with overlap.", file=sys.stderr)
+        if seq_set:
+            missing_seq = sorted(seq_set - avail_sequences)
+            if missing_seq:
+                print(f"[inputset:{inputset_name}] WARN: feature '{feat_name}' run '{run_id}' missing requested sequences {missing_seq}; continuing with overlap.", file=sys.stderr)
+
+        df_scope = df
+        if groups_set:
+            df_scope = df_scope[df_scope["group"].isin(groups_set)]
+        if seq_set:
+            df_scope = df_scope[df_scope["sequence"].isin(seq_set)]
+
+        pairs = set(zip(df_scope["group"], df_scope["sequence"]))
+        if not pairs:
+            print(f"[inputset:{inputset_name}] WARN: feature '{feat_name}' run '{run_id}' has no data matching the requested scope.", file=sys.stderr)
+        per_feature_pairs.append(pairs)
+        resolved_inputs.append({"feature": feat_name, "run_id": run_id})
+
+        for _, row in df_scope.iterrows():
+            pair = (row["group"], row["sequence"])
+            seq_safe = row.get("sequence_safe")
+            if not isinstance(seq_safe, str) or not seq_safe:
+                seq_safe = to_safe_name(pair[1])
+            pair_safe_map.setdefault(pair, seq_safe)
+
+    if not per_feature_pairs:
+        raise ValueError(f"Inputset '{inputset_name}' resolved no usable feature runs.")
+
+    allowed_pairs = set.intersection(*per_feature_pairs) if per_feature_pairs else set()
+    if not allowed_pairs:
+        raise ValueError(f"Inputset '{inputset_name}' has no overlapping sequences for the requested scope.")
+
+    safe_sequences = {pair_safe_map.get(pair, to_safe_name(pair[1])) for pair in allowed_pairs}
+
+    return {
+        "inputset": inputset_name,
+        "meta": meta,
+        "groups": sorted(groups_set) if groups_set else None,
+        "sequences": sorted(seq_set) if seq_set else None,
+        "pairs": allowed_pairs,
+        "pair_safe_map": {pair: pair_safe_map.get(pair, to_safe_name(pair[1])) for pair in allowed_pairs},
+        "safe_sequences": safe_sequences,
+        "resolved_inputs": resolved_inputs,
+    }
+
+
+def _yield_inputset_frames(ds: "Dataset",
+                           inputset_name: str,
+                           groups: Optional[Iterable[str]] = None,
+                           sequences: Optional[Iterable[str]] = None,
+                           scope: Optional[dict] = None):
+    scope = scope or _resolve_inputset_scope(ds, inputset_name, groups, sequences)
+    allowed_pairs = scope.get("pairs") or set()
+    if not allowed_pairs:
+        return
+    yield from _yield_sequences(ds, groups, sequences, allowed_pairs=allowed_pairs)
+
 @dataclass
 class FeatureRunInfo:
     feature: str
@@ -1420,10 +1791,27 @@ def _ensure_feature_index(idx_path: Path):
             "finished_at": pd.Series(dtype="string"),
         }).to_csv(idx_path, index=False)
 
+def _ensure_text_column(df: pd.DataFrame, column: str, fill: str = "") -> pd.DataFrame:
+    """
+    Make sure df[column] exists with object/string dtype so string assignments won't raise warnings.
+    """
+    if column not in df.columns:
+        df[column] = fill
+    else:
+        if df[column].dtype != object:
+            df[column] = df[column].astype(object)
+        if fill is not None:
+            df.loc[df[column].isna(), column] = fill
+    return df
+
 def _append_feature_index(idx_path: Path, rows: list[dict]):
     if not idx_path.exists():
         _ensure_feature_index(idx_path)
     df = pd.read_csv(idx_path)
+    for col in ["feature", "version", "run_id", "group", "sequence",
+                "group_safe", "sequence_safe", "abs_path",
+                "params_hash", "started_at", "finished_at"]:
+        df = _ensure_text_column(df, col, "")
     # Ensure group_safe/sequence_safe and finished_at in new rows
     new_rows = []
     for r in rows:
@@ -1446,12 +1834,60 @@ def _append_feature_index(idx_path: Path, rows: list[dict]):
 
 def _update_finished_times(idx_path: Path, run_id: str, finished_at: str):
     df = pd.read_csv(idx_path)
-    if "finished_at" not in df.columns:
-        df["finished_at"] = ""
-    sel = (df["run_id"] == run_id) & ((df["finished_at"].isna()) | (df["finished_at"] == ""))
+    df = _ensure_text_column(df, "run_id", "")
+    df = _ensure_text_column(df, "finished_at", "")
+    sel = (df["run_id"] == str(run_id)) & ((df["finished_at"].isna()) | (df["finished_at"] == ""))
     if sel.any():
         df.loc[sel, "finished_at"] = str(finished_at)
         df.to_csv(idx_path, index=False)
+
+def _ensure_labels_index(idx_path: Path):
+    if not idx_path.exists():
+        idx_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({
+            "kind": pd.Series(dtype="string"),
+            "label_format": pd.Series(dtype="string"),
+            "group": pd.Series(dtype="string"),
+            "sequence": pd.Series(dtype="string"),
+            "group_safe": pd.Series(dtype="string"),
+            "sequence_safe": pd.Series(dtype="string"),
+            "abs_path": pd.Series(dtype="string"),
+            "source_abs_path": pd.Series(dtype="string"),
+            "source_md5": pd.Series(dtype="string"),
+            "n_frames": pd.Series(dtype="Int64"),
+            "label_ids": pd.Series(dtype="string"),
+            "label_names": pd.Series(dtype="string"),
+        }).to_csv(idx_path, index=False)
+
+def _append_labels_index(idx_path: Path, rows: list[dict]):
+    if not idx_path.exists():
+        _ensure_labels_index(idx_path)
+    df = pd.read_csv(idx_path)
+    for col in LABEL_INDEX_COLUMNS:
+        fill = "" if col != "n_frames" else None
+        df = _ensure_text_column(df, col, "" if fill is None else fill)
+    updated = df.copy()
+    for r in rows:
+        row = dict(r)
+        row.setdefault("kind", "")
+        row.setdefault("label_format", "")
+        row.setdefault("group", "")
+        row.setdefault("sequence", "")
+        if "group_safe" not in row:
+            row["group_safe"] = to_safe_name(row["group"]) if row["group"] else ""
+        if "sequence_safe" not in row:
+            row["sequence_safe"] = to_safe_name(row["sequence"]) if row["sequence"] else ""
+        row.setdefault("abs_path", "")
+        row.setdefault("source_abs_path", "")
+        row.setdefault("source_md5", "")
+        if "n_frames" not in row:
+            row["n_frames"] = ""
+        row.setdefault("label_ids", "")
+        row.setdefault("label_names", "")
+        mask = (updated["group"].fillna("") == row["group"]) & (updated["sequence"].fillna("") == row["sequence"])
+        updated = updated[~mask]
+        updated = pd.concat([updated, pd.DataFrame([row])], ignore_index=True)
+    updated.to_csv(idx_path, index=False)
 
 def _list_feature_runs(ds: "Dataset", feature_name: str) -> pd.DataFrame:
     idx = _feature_index_path(ds, feature_name)
@@ -1516,7 +1952,7 @@ def run_feature(self,
     # Determine on-disk storage name (may encode upstream)
     storage_feature_name = getattr(feature, "storage_feature_name", feature.name)
     use_input_suffix = getattr(feature, "storage_use_input_suffix", True)
-    if input_kind == "feature" and input_feature and use_input_suffix:
+    if input_kind in {"feature", "inputset"} and input_feature and use_input_suffix:
         storage_feature_name = f"{storage_feature_name}__from__{input_feature}"
 
     # Prepare run id & root
@@ -1530,12 +1966,18 @@ def run_feature(self,
     started = _now_iso()
 
     # Choose input iterator
-    if input_kind not in {"tracks", "feature"}:
-        raise ValueError("input_kind must be 'tracks' or 'feature'")
+    input_scope = None
+    if input_kind not in {"tracks", "feature", "inputset"}:
+        raise ValueError("input_kind must be 'tracks', 'feature', or 'inputset'")
     if input_kind == "feature":
         if not input_feature:
             raise ValueError("input_feature must be provided when input_kind='feature'")
         iter_inputs = lambda: _yield_feature_frames(self, input_feature, input_run_id, groups, sequences)
+    elif input_kind == "inputset":
+        if not input_feature:
+            raise ValueError("input_feature (inputset name) must be provided when input_kind='inputset'")
+        input_scope = _resolve_inputset_scope(self, input_feature, groups, sequences)
+        iter_inputs = lambda: _yield_inputset_frames(self, input_feature, groups, sequences, input_scope)
     else:
         iter_inputs = lambda: _yield_sequences(self, groups, sequences)
 
@@ -1545,6 +1987,39 @@ def run_feature(self,
             feature.bind_dataset(self)   # allow feature to read feature indexes & roots
         except Exception as e:
             print(f"[feature:{feature.name}] bind_dataset failed: {e}", file=sys.stderr)
+
+    scope_constraints = {}
+    if input_scope is not None:
+        for key in ("groups", "sequences", "safe_sequences", "pairs", "pair_safe_map"):
+            val = input_scope.get(key)
+            if val:
+                scope_constraints[key] = val
+    if groups is not None:
+        norm_groups = sorted({str(g) for g in groups})
+        if norm_groups:
+            scope_constraints["groups"] = norm_groups
+            scope_constraints["safe_groups"] = sorted({to_safe_name(g) for g in norm_groups})
+    if sequences is not None:
+        norm_sequences = sorted({str(s) for s in sequences})
+        if norm_sequences:
+            scope_constraints["sequences"] = norm_sequences
+            if not scope_constraints.get("safe_sequences"):
+                scope_constraints["safe_sequences"] = sorted({to_safe_name(s) for s in norm_sequences})
+    if scope_constraints:
+        setattr(feature, "_scope_constraints", scope_constraints)
+        if hasattr(feature, "set_scope_constraints"):
+            try:
+                feature.set_scope_constraints(scope_constraints)
+            except Exception as e:
+                print(f"[feature:{feature.name}] set_scope_constraints failed: {e}", file=sys.stderr)
+
+    if input_scope is not None:
+        setattr(feature, "_scope_filter", input_scope)
+        if hasattr(feature, "set_scope_filter"):
+            try:
+                feature.set_scope_filter(input_scope)
+            except Exception as e:
+                print(f"[feature:{feature.name}] set_scope_filter failed: {e}", file=sys.stderr)
     if feature.needs_fit():
         if feature.supports_partial_fit():
             for _, _, df in iter_inputs():

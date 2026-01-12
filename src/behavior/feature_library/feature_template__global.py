@@ -9,18 +9,12 @@ from behavior.dataset import (
     _latest_feature_run_root,
     _resolve_inputs,
 )
-from behavior.features import (
+from .helpers import (
     _build_path_sequence_map,
     _load_array_from_spec,
+    _merge_params,
 )
 from behavior.helpers import to_safe_name
-
-def _merge_params(overrides: Optional[Dict[str, Any]], defaults: Dict[str, Any]) -> Dict[str, Any]:
-    if not overrides:
-        return dict(defaults)
-    out = dict(defaults)
-    out.update({k: v for k, v in overrides.items() if v is not None})
-    return out
 
 @register_feature
 class MyGlobalFeature:

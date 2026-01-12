@@ -1,3 +1,9 @@
+"""
+BehaviorXGBoostModel - XGBoost-based behavior classifier.
+
+Extracted from models_behavior.py as part of model_library modularization.
+"""
+
 from __future__ import annotations
 
 import json
@@ -7,8 +13,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import RandomUnderSampler
 from sklearn.decomposition import PCA
 from sklearn.metrics import (
     average_precision_score,
@@ -19,110 +23,15 @@ from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 import xgboost as xgb
 
-from .dataset import (
+from behavior.dataset import (
     _feature_index_path,
     _feature_run_root,
     _latest_feature_run_root,
     _resolve_inputs,
     _yield_feature_frames,
 )
-from .helpers import to_safe_name
-
-
-XGB_PARAM_PRESETS: Dict[str, dict] = {
-    "xgb_v0": dict(
-        objective="binary:logistic",
-        tree_method="hist",
-        device="cuda",
-        n_estimators=1500,
-        learning_rate=0.05,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        reg_alpha=0.0,
-        n_jobs=-1,
-        random_state=123,
-        eval_metric="logloss",
-    ),
-    "xgb_v1": dict(
-        objective="binary:logistic",
-        device="cuda",
-        tree_method="hist",
-        eval_metric=["logloss", "aucpr"],
-        n_estimators=3000,
-        learning_rate=0.03,
-        max_depth=10,
-        min_child_weight=8,
-        gamma=2.0,
-        subsample=0.7,
-        colsample_bytree=0.6,
-        colsample_bylevel=0.8,
-        reg_lambda=2.0,
-        reg_alpha=0.5,
-        max_bin=256,
-        sampling_method="gradient_based",
-        n_jobs=-1,
-        random_state=123,
-    ),
-    "xgb_v2": dict(
-        objective="binary:logistic",
-        device="cuda",
-        tree_method="hist",
-        eval_metric=["logloss", "aucpr"],
-        n_estimators=4000,
-        learning_rate=0.02,
-        max_depth=4,
-        min_child_weight=3,
-        gamma=0.0,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_lambda=1.0,
-        reg_alpha=0.0,
-        max_bin=256,
-        sampling_method="gradient_based",
-        n_jobs=-1,
-        random_state=123,
-    ),
-}
-
-
-def to_jsonable(obj):
-    if isinstance(obj, dict):
-        return {str(k): to_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [to_jsonable(v) for v in obj]
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    if isinstance(obj, Path):
-        return str(obj)
-    return obj
-
-
-def undersample_then_smote(X, y, use_undersample, undersample_ratio, use_smote, random_state=42):
-    if use_undersample:
-        classes, counts = np.unique(y, return_counts=True)
-        if len(classes) == 2:
-            maj = classes[np.argmax(counts)]
-            minc = classes[np.argmin(counts)]
-            n_min = counts.min()
-            n_maj_target = int(round(n_min * undersample_ratio))
-            sampling_strategy = {
-                minc: n_min,
-                maj: min(n_maj_target, counts.max()),
-            }
-            rus = RandomUnderSampler(sampling_strategy=sampling_strategy, random_state=random_state)
-            X, y = rus.fit_resample(X, y)
-    if use_smote:
-        sm = SMOTE(random_state=random_state)
-        X, y = sm.fit_resample(X, y)
-    return X, y
+from behavior.helpers import to_safe_name
+from .helpers import XGB_PARAM_PRESETS, to_jsonable, undersample_then_smote
 
 
 class BehaviorXGBoostModel:
@@ -1004,24 +913,6 @@ class BehaviorXGBoostModel:
         """
         Shared scoring helper that matches the training-time branch.
         """
-        if hasattr(model, "predict_proba"):
-            out = model.predict_proba(X)
-            out = np.asarray(out)
-            if out.ndim == 2 and out.shape[1] > 1:
-                return out[:, 1]
-            return out.ravel()
-        if isinstance(model, xgb.Booster):
-            dmat = xgb.DMatrix(X)
-            return model.predict(dmat)
-        if hasattr(model, "predict"):
-            out = model.predict(X)
-            out = np.asarray(out)
-            if out.ndim > 1:
-                out = out[:, 0]
-            return out.ravel()
-        raise RuntimeError("Unsupported model type for prediction.")
-
-def _predict_scores(self, model, X: np.ndarray) -> np.ndarray:
         if hasattr(model, "predict_proba"):
             out = model.predict_proba(X)
             out = np.asarray(out)

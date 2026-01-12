@@ -9,7 +9,7 @@ import pandas as pd
 from sklearn.decomposition import IncrementalPCA
 
 from behavior.dataset import register_feature
-from behavior.features import _merge_params
+from .helpers import _merge_params
 from behavior.helpers import to_safe_name
 
 

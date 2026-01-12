@@ -159,6 +159,42 @@ TRACK_SEQ_ENUM: dict[str, TrackSeqEnumerator] = {}
 def register_track_seq_enumerator(src_format: str, fn: TrackSeqEnumerator):
     TRACK_SEQ_ENUM[src_format] = fn
 
+# ----------- Label converter registry -----------
+from typing import Protocol
+
+class LabelConverter(Protocol):
+    """Protocol for label converter plugins."""
+    src_format: str              # e.g., "calms21_npy", "boris_csv"
+    label_kind: str              # e.g., "behavior", "id_tags"
+    label_format: str            # e.g., "calms21_behavior_v1"
+
+    def convert(self,
+                src_path: Path,
+                raw_row: pd.Series,
+                labels_root: Path,
+                params: dict,
+                overwrite: bool,
+                existing_pairs: set[tuple[str, str]]) -> list[dict]:
+        """
+        Convert a source file to label npz files.
+
+        Returns: List of index row dicts for labels/index.csv
+        """
+        ...
+
+    def get_metadata(self) -> dict:
+        """Optional: return format-specific metadata for dataset.meta['labels'][kind]."""
+        ...
+
+# Registry: (src_format, label_kind) -> converter class
+LABEL_CONVERTERS: dict[tuple[str, str], type] = {}
+
+def register_label_converter(cls: type):
+    """Decorator to register label converters."""
+    key = (cls.src_format, cls.label_kind)
+    LABEL_CONVERTERS[key] = cls
+    return cls
+
 # ----------- Track schema system -----------
 from dataclasses import dataclass
 from typing import List, Set, Dict, Optional, Iterable
@@ -1170,31 +1206,74 @@ class Dataset:
                            overwrite: bool = False,
                            params: Optional[dict] = None,
                            source_format: Optional[str] = None,
-                           group_from: Optional[str] = None) -> None:
+                           **kwargs) -> None:
         """
-        Convert behavioral labels from raw CalMS21 files into per-sequence npz bundles under labels/<kind>.
+        Convert labels from raw files using registered label converters.
+
+        This method now uses a plugin architecture via the label_library.
+        Converters are automatically registered for different source formats.
 
         Parameters
         ----------
-        group_from : {'filename','infile','both'}
-            Determines which group name is used for the output artifacts/index.
-            - 'filename' (default): use the tracks_raw/index.csv group column (e.g., calms21_task1_train).
-            - 'infile': keep the original nested group from inside the CalMS21 payload (e.g., annotator-id_0).
-            - 'both': write outputs under the filename group but record the infile group in the npz metadata.
+        kind : str, default="behavior"
+            Type of labels to convert (e.g., "behavior", "id_tags")
+        overwrite : bool, default=False
+            Whether to overwrite existing label files
+        params : dict, optional
+            Configuration parameters passed to converter
+        source_format : str, optional
+            Source format identifier (e.g., "calms21_npy", "boris_csv")
+            Must match a registered converter's src_format
+        **kwargs : additional keyword arguments
+            Passed to converter (e.g., group_from, fps, etc.)
+
+        Raises
+        ------
+        ValueError
+            If no converter is registered for (source_format, kind) combination
+        FileNotFoundError
+            If tracks_raw/index.csv is missing
+
+        Examples
+        --------
+        Convert CalMS21 labels:
+        >>> dataset.convert_all_labels(
+        ...     kind="behavior",
+        ...     source_format="calms21_npy",
+        ...     group_from="filename"
+        ... )
+
+        Convert Boris labels (once implemented):
+        >>> dataset.convert_all_labels(
+        ...     kind="behavior",
+        ...     source_format="boris_csv",
+        ...     fps=30.0
+        ... )
         """
         params = params or {}
         kind = str(kind or "").lower()
-        if kind != "behavior":
-            raise ValueError(f"Unsupported label kind '{kind}'. Only 'behavior' implemented.")
+        src_format = source_format or params.get("source_format", "calms21_npy")
 
-        src_format = source_format or params.get("source_format") or "calms21_npy"
-        group_from = group_from or params.get("group_from") or "filename"
-        group_from = str(group_from).lower()
-        if group_from not in {"infile", "filename", "both"}:
-            raise ValueError("group_from must be 'infile', 'filename', or 'both'")
+        # Look up converter in registry
+        converter_key = (src_format, kind)
+        if converter_key not in LABEL_CONVERTERS:
+            available = list(LABEL_CONVERTERS.keys())
+            raise ValueError(
+                f"No label converter registered for (src_format='{src_format}', kind='{kind}'). "
+                f"Available converters: {available}\n"
+                f"To add support for a new format, create a converter in label_library/ "
+                f"and import it in label_library/__init__.py"
+            )
+
+        # Instantiate converter
+        converter_cls = LABEL_CONVERTERS[converter_key]
+        converter = converter_cls(params=params, **kwargs)
+
+        # Load raw index
         raw_idx = self.get_root("tracks_raw") / "index.csv"
         if not raw_idx.exists():
             raise FileNotFoundError("tracks_raw/index.csv not found; run index_tracks_raw first.")
+
         df_raw = pd.read_csv(raw_idx)
         if "src_format" not in df_raw.columns:
             raise ValueError("tracks_raw/index.csv missing 'src_format' column.")
@@ -1202,12 +1281,13 @@ class Dataset:
         if df_raw.empty:
             raise ValueError(f"No rows in tracks_raw/index.csv with src_format='{src_format}'.")
 
+        # Setup output directory
         labels_root = self.get_root("labels") / kind
         labels_root.mkdir(parents=True, exist_ok=True)
         idx_path = labels_root / "index.csv"
-        if not idx_path.exists():
-            _ensure_labels_index(idx_path)
+        _ensure_labels_index(idx_path)
 
+        # Load existing pairs
         existing_pairs: set[tuple[str, str]] = set()
         if idx_path.exists():
             df_idx = pd.read_csv(idx_path)
@@ -1216,106 +1296,43 @@ class Dataset:
                 seqs = df_idx.get("sequence", pd.Series(dtype=str)).fillna("")
                 existing_pairs = set(zip(grouped.astype(str), seqs.astype(str)))
 
+        # Convert each raw file using the converter
         new_rows: list[dict] = []
-        total_sequences = 0
         for _, raw_row in df_raw.iterrows():
-            created = self._convert_calms21_behavior_labels(
-                raw_row,
-                labels_root,
+            src_path = Path(raw_row["abs_path"])
+            created = converter.convert(
+                src_path=src_path,
+                raw_row=raw_row,
+                labels_root=labels_root,
+                params=params,
                 overwrite=overwrite,
                 existing_pairs=existing_pairs,
-                group_from=group_from,
             )
             if created:
                 new_rows.extend(created)
-                total_sequences += len(created)
 
+        # Update index and metadata
         if new_rows:
             _append_labels_index(idx_path, new_rows)
+
+            # Update metadata with converter's metadata
             labels_meta = self.meta.setdefault("labels", {})
-            labels_meta["behavior"] = {
+            labels_meta[kind] = {
                 "index": str(idx_path.resolve()),
-                "label_format": "calms21_behavior_v1",
-                "label_ids": list(BEHAVIOR_LABEL_MAP.keys()),
-                "label_names": list(BEHAVIOR_LABEL_MAP.values()),
+                "label_format": converter.label_format,
                 "updated_at": _now_iso(),
             }
+
+            # Add format-specific metadata if converter provides it
+            if hasattr(converter, 'get_metadata'):
+                labels_meta[kind].update(converter.get_metadata())
+
             try:
                 self.save()
             except Exception:
                 pass
-        print(f"[convert_all_labels] kind={kind} wrote {len(new_rows)} sequences (overwrite={overwrite}).")
 
-    def _convert_calms21_behavior_labels(self,
-                                         raw_row: pd.Series,
-                                         labels_root: Path,
-                                         overwrite: bool,
-                                         existing_pairs: set[tuple[str, str]],
-                                         group_from: str = "filename") -> list[dict]:
-        """
-        Convert one CalMS21 npy/json row into per-sequence behavior label npz files.
-        """
-        src_path = Path(raw_row["abs_path"])
-        nested = load_calms21(src_path)
-        rows_out: list[dict] = []
-        label_ids = np.array(list(BEHAVIOR_LABEL_MAP.keys()), dtype=int)
-        label_names = np.array(list(BEHAVIOR_LABEL_MAP.values()), dtype=object)
-        raw_group_hint = str(raw_row.get("group", "") or "")
-
-        for group_name, seqs in nested.items():
-            group_val_infile = str(group_name or "")
-            if group_from == "filename" and raw_group_hint:
-                group_val = raw_group_hint
-            elif group_from == "both" and raw_group_hint:
-                group_val = raw_group_hint
-            else:
-                group_val = group_val_infile
-            for seq_key, seq_dict in seqs.items():
-                if "annotations" not in seq_dict:
-                    continue
-                labels = np.asarray(seq_dict["annotations"])
-                if labels.ndim > 1:
-                    labels = labels[:, 0]
-                labels = labels.astype(int, copy=False)
-                frames = np.arange(labels.shape[0], dtype=np.int32)
-                seq_val = str(seq_key)
-                pair = (group_val, seq_val)
-                safe_group = to_safe_name(group_val) if group_val else ""
-                safe_seq = to_safe_name(seq_val)
-                fname = f"{safe_group + '__' if safe_group else ''}{safe_seq}.npz"
-                out_path = labels_root / fname
-
-                if not overwrite and pair in existing_pairs and out_path.exists():
-                    continue
-
-                payload = {
-                    "group": group_val,
-                    "sequence": seq_val,
-                    "sequence_key": seq_val,
-                    "frames": frames,
-                    "labels": labels,
-                    "label_ids": label_ids,
-                    "label_names": label_names,
-                }
-                if group_from in {"filename", "both"} and group_val_infile and group_val_infile != group_val:
-                    payload["source_group"] = group_val_infile
-                np.savez_compressed(out_path, **payload)
-                existing_pairs.add(pair)
-                rows_out.append({
-                    "kind": "behavior",
-                    "label_format": "calms21_behavior_v1",
-                    "group": group_val,
-                    "sequence": seq_val,
-                    "group_safe": safe_group,
-                    "sequence_safe": safe_seq,
-                    "abs_path": str(out_path.resolve()),
-                    "source_abs_path": str(src_path.resolve()),
-                    "source_md5": raw_row.get("md5", ""),
-                    "n_frames": int(labels.shape[0]),
-                    "label_ids": ",".join(map(str, BEHAVIOR_LABEL_MAP.keys())),
-                    "label_names": ",".join(BEHAVIOR_LABEL_MAP.values()),
-                })
-        return rows_out
+        print(f"[convert_all_labels] kind={kind} wrote {len(new_rows)} sequences using {src_format} converter (overwrite={overwrite}).")
 
     def save_id_labels(self,
                        kind: str,
@@ -2428,6 +2445,9 @@ def _json_ready(obj):
         return str(obj)
     if isinstance(obj, (np.generic,)):
         return obj.item()
+    # Handle sentinel objects and other non-JSON-serializable types
+    if not isinstance(obj, (str, int, float, bool, type(None))):
+        return f"<{type(obj).__name__}>"
     return obj
 
 
@@ -3235,7 +3255,7 @@ def run_feature(self,
         try:
             feature.save_model(model_path)
         except NotImplementedError:
-            print('No Feature Implemented')
+            # Feature doesn't implement save_model() - this is optional, so just skip
             pass
 
     # ===== TRANSFORM PHASE =====

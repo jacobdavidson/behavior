@@ -38,6 +38,7 @@ class GlobalWardClustering:
 
     name    = "global-ward"
     version = "0.1"
+    output_type = "global"
 
     def __init__(self, params: Optional[dict] = None):
         self.params = {

@@ -56,6 +56,7 @@ class WardAssignClustering:
     name = "ward-assign"
     version = "0.1"
     parallelizable = True
+    output_type = "global"
 
     def __init__(self, params: Optional[dict] = None):
         self.params = {

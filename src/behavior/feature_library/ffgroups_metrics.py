@@ -40,6 +40,7 @@ class FFGroupsMetrics:
     name = "ffgroups-metrics"
     version = "0.1"
     parallelizable = True
+    output_type = "summary"
 
     _defaults = dict(
         id_col="id",

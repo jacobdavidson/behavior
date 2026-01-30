@@ -27,6 +27,7 @@ class IdTagColumns:
     name = "id-tag-columns"
     version = "0.1"
     parallelizable = True
+    output_type = "per_frame"
 
     _defaults = dict(
         label_kind="id_tags",

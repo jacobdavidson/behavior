@@ -84,6 +84,7 @@ class GlobalKMeansClustering:
 
     name: str = "global-kmeans"
     version: str = "0.3"
+    output_type: str = "global"
 
     def __init__(self, params: dict | None = None):
         self.params = {

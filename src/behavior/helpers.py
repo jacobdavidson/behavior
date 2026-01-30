@@ -378,6 +378,61 @@ def chunk_sequence(df: pd.DataFrame,
 
 
 # =============================================================================
+# Time/Frame Range Filtering
+# =============================================================================
+
+def filter_time_range(
+    df: pd.DataFrame,
+    filter_start_frame: Optional[int] = None,
+    filter_end_frame: Optional[int] = None,
+    filter_start_time: Optional[float] = None,
+    filter_end_time: Optional[float] = None,
+    frame_col: str = "frame",
+    time_col: str = "time",
+) -> pd.DataFrame:
+    """
+    Filter DataFrame to a time/frame range.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame with frame and/or time columns
+    filter_start_frame : int, optional
+        Discard frames < this value
+    filter_end_frame : int, optional
+        Discard frames >= this value
+    filter_start_time : float, optional
+        Discard rows where time < this value (seconds)
+    filter_end_time : float, optional
+        Discard rows where time >= this value (seconds)
+    frame_col : str, default "frame"
+        Name of the frame column
+    time_col : str, default "time"
+        Name of the time column
+
+    Returns
+    -------
+    pd.DataFrame
+        Filtered DataFrame with index reset
+    """
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+
+    mask = pd.Series(True, index=df.index)
+
+    if filter_start_frame is not None and frame_col in df.columns:
+        mask &= df[frame_col] >= filter_start_frame
+    if filter_end_frame is not None and frame_col in df.columns:
+        mask &= df[frame_col] < filter_end_frame
+    if filter_start_time is not None and time_col in df.columns:
+        mask &= df[time_col] >= filter_start_time
+    if filter_end_time is not None and time_col in df.columns:
+        mask &= df[time_col] < filter_end_time
+
+    return df.loc[mask].reset_index(drop=True)
+
+
+# =============================================================================
 # Hierarchical Naming Helpers
 # =============================================================================
 

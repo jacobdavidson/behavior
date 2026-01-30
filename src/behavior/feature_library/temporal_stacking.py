@@ -31,6 +31,7 @@ class TemporalStackingFeature:
     name = "temporal-stack"
     version = "0.1"
     parallelizable = True
+    output_type = None  # Custom chunked output
 
     def __init__(self, params: Optional[Dict[str, Any]] = None):
         defaults = {

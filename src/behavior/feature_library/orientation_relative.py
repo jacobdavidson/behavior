@@ -30,6 +30,7 @@ class OrientationRelativeFeature:
     name = "orientation-rel"
     version = "0.1"
     parallelizable = True
+    output_type = "per_frame"
 
     def __init__(self, params: Optional[Dict[str, Any]] = None):
         defaults = {

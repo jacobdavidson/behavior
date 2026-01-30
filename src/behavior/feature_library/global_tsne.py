@@ -42,6 +42,7 @@ class GlobalTSNE:
     """
     name: str = "global-tsne"
     version: str = "0.2"
+    output_type: str = "global"
     params: dict
 
     def __init__(self, params: Optional[dict] = None):

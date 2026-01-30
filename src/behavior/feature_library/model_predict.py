@@ -24,6 +24,7 @@ class ModelPredictFeature:
     name = "model-predict"
     version = "0.1"
     parallelizable = True
+    output_type = None  # Output depends on the model
 
     def __init__(self, params: Optional[Dict[str, Any]] = None):
         defaults = {

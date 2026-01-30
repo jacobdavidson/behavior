@@ -13,7 +13,7 @@ import multiprocessing as mp
 import csv, json, os, sys, re, subprocess, shlex, gc, textwrap
 from urllib.parse import urlparse, parse_qs, urlencode
 import fnmatch
-from .helpers import to_safe_name, from_safe_name
+from .helpers import to_safe_name, from_safe_name, filter_time_range
 
 from typing import Protocol, Iterable, Optional, Sequence
 from dataclasses import dataclass
@@ -326,9 +326,34 @@ def _inputset_path(ds, name: str) -> Path:
 
 
 def save_inputset(ds, name: str, inputs: list[dict], description: Optional[str] = None,
-                  overwrite: bool = False) -> Path:
+                  overwrite: bool = False,
+                  filter_start_frame: Optional[int] = None,
+                  filter_end_frame: Optional[int] = None,
+                  filter_start_time: Optional[float] = None,
+                  filter_end_time: Optional[float] = None) -> Path:
     """
     Persist an inputset JSON under <dataset_root>/inputsets/<name>.json.
+
+    Parameters
+    ----------
+    ds : Dataset
+        The dataset instance
+    name : str
+        Name for the inputset
+    inputs : list[dict]
+        List of input specifications
+    description : str, optional
+        Human-readable description
+    overwrite : bool, default False
+        Whether to overwrite existing inputset
+    filter_start_frame : int, optional
+        Discard frames < this value when loading
+    filter_end_frame : int, optional
+        Discard frames >= this value when loading
+    filter_start_time : float, optional
+        Discard rows where time < this value (seconds)
+    filter_end_time : float, optional
+        Discard rows where time >= this value (seconds)
     """
     path = _inputset_path(ds, name)
     if path.exists() and not overwrite:
@@ -338,6 +363,15 @@ def save_inputset(ds, name: str, inputs: list[dict], description: Optional[str] 
         "description": description or "",
         "inputs": inputs or [],
     }
+    # Add filter params if any are specified
+    if filter_start_frame is not None:
+        payload["filter_start_frame"] = filter_start_frame
+    if filter_end_frame is not None:
+        payload["filter_end_frame"] = filter_end_frame
+    if filter_start_time is not None:
+        payload["filter_start_time"] = filter_start_time
+    if filter_end_time is not None:
+        payload["filter_end_time"] = filter_end_time
     path.write_text(json.dumps(payload, indent=2))
     return path
 
@@ -360,6 +394,11 @@ def _load_inputset(ds, name: str) -> tuple[list[dict], dict]:
         "inputs_source": "inputset",
         "inputset_path": str(path),
         "description": data.get("description", ""),
+        # Time/frame filtering params
+        "filter_start_frame": data.get("filter_start_frame"),
+        "filter_end_frame": data.get("filter_end_frame"),
+        "filter_start_time": data.get("filter_start_time"),
+        "filter_end_time": data.get("filter_end_time"),
     }
     return inputs, meta
 
@@ -3335,6 +3374,19 @@ def _yield_inputset_frames(ds: "Dataset",
                 df = pd.concat([df.reset_index(drop=True), df_feat.reset_index(drop=True)], axis=1)
             else:
                 df = df.merge(df_feat, how="left", on=on_cols)
+
+        # Apply inputset-level time/frame filtering
+        meta = scope.get("meta") or {}
+        df = filter_time_range(
+            df,
+            filter_start_frame=meta.get("filter_start_frame"),
+            filter_end_frame=meta.get("filter_end_frame"),
+            filter_start_time=meta.get("filter_start_time"),
+            filter_end_time=meta.get("filter_end_time"),
+        )
+        if df.empty:
+            continue
+
         yield g, s, df
 
 @dataclass

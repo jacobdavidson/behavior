@@ -32,6 +32,7 @@ class PairEgocentricFeatures:
     name    = "pair-egocentric"
     version = "0.1"
     parallelizable = True
+    output_type = "per_frame"
 
     _defaults = dict(
         # pose / columns

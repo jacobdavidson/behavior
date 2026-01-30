@@ -22,6 +22,8 @@ class PairPoseDistancePCA:
 
     name = "pair-posedistance-pca"
     version = "0.1"
+    parallelizable = True
+    output_type = "per_frame"
 
     _defaults = dict(
         pose_n=7,

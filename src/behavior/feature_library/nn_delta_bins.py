@@ -98,6 +98,7 @@ class NearestNeighborDeltaBins:
     name = "nn-delta-bins"
     version = "0.1"
     parallelizable = True
+    output_type = "summary"
 
     _defaults = dict(
         nbins=45,

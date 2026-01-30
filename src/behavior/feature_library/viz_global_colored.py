@@ -53,6 +53,7 @@ class VizGlobalColored:
 
     name = "viz-global-colored"
     version = "0.1"
+    output_type = "viz"
 
     def __init__(self, params=None):
         defaults = {

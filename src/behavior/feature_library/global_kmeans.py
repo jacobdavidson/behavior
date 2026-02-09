@@ -6,20 +6,17 @@ Extracted from features.py as part of feature_library modularization.
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Dict, Any, Iterable, List, Tuple
-import re
+from typing import Optional, Dict, Any, Iterable
+import sys
 
 import numpy as np
 import pandas as pd
 import joblib
 
-from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
-from behavior.dataset import register_feature
-from .helpers import _build_path_sequence_map, _load_array_from_spec
-from behavior.dataset import _resolve_inputs, _feature_index_path, _feature_run_root
-from behavior.helpers import to_safe_name
+from behavior.dataset import register_feature, _resolve_inputs
+from .helpers import StreamingFeatureHelper
 
 
 @register_feature
@@ -113,183 +110,23 @@ class GlobalKMeansClustering:
         self._fit_artifact_info = None    # dict saved to JSON
         self._artifact_labels = None      # np.ndarray[int] (optional)
         self._assign_labels = {}          # dict[safe_seq] = labels (int32)
-        self._seq_path_cache: Dict[Tuple[str, str], Dict[Path, str]] = {}
         assign_config = self.params.get("assign") or {}
         self._assign_inputs_override = "inputs" in assign_config
         self._assign_inputs_meta: Dict[str, Any] = {}
-        self._scope_constraints: Optional[dict[str, set[str]]] = None
-
-    def _load_one_general(self, path: Path, spec: dict) -> np.ndarray:
-        arr = _load_array_from_spec(path, spec)
-        if arr is None:
-            return np.empty((0, 0), dtype=np.float32)
-        if arr.ndim != 2:
-            raise ValueError(f"_load_one_general: Loaded array is not 2D: {arr.shape}")
-        return arr
-
-    def _feature_seq_map(self, feature_name: str, run_id: str | None) -> dict[Path, str]:
-        key = (feature_name, str(run_id))
-        if key in self._seq_path_cache:
-            return self._seq_path_cache[key]
-        mapping = _build_path_sequence_map(self._ds, feature_name, run_id)
-        self._seq_path_cache[key] = mapping
-        return mapping
-
-    def _extract_key_from_path(self, path: Path, seq_map: dict[Path, str]) -> str:
-        """
-        Extract safe_seq from file path using naming convention or dataset index fallback.
-        """
-        stem = path.stem
-        m_seq = re.search(r"seq=(.+?)(?:_persp=.*)?$", stem)
-        if m_seq:
-            safe_seq = m_seq.group(1)
-        else:
-            safe_seq = seq_map.get(path.resolve())
-        if not safe_seq:
-            safe_seq = to_safe_name(stem)
-        return str(safe_seq)
-
-    def _collect_inputs_per_key(self, inputs: list[dict]) -> dict[str, list[np.ndarray]]:
-        """
-        For each input spec, glob pattern, load each file as matrix, group by sequence.
-        Returns dict[safe_seq] -> list[np.ndarray]
-        """
-        per_key_parts = {}
-        scope_active = bool(self._scope_constraints)
-        for spec in inputs:
-            feat_name = spec["feature"]
-            run_id = spec.get("run_id")
-            resolved_run_id, run_root = self._resolve_feature_run_root(feat_name, run_id)
-            pattern = spec.get("pattern", "*.npz")
-            load_spec = spec.get("load", {"kind": "npz", "key": "spectrogram", "transpose": True})
-            files = sorted(run_root.glob(pattern))
-            seq_map = self._feature_seq_map(feat_name, resolved_run_id)
-            meta_map = self._feature_path_metadata(feat_name, resolved_run_id) if scope_active else {}
-            for pth in files:
-                try:
-                    abs_path = pth.resolve()
-                except Exception:
-                    abs_path = pth
-                meta = meta_map.get(abs_path, {})
-                group_val = str(meta.get("group", "") or "")
-                seq_val = str(meta.get("sequence", "") or "")
-                safe_seq = str(meta.get("sequence_safe", "") or "")
-                if not safe_seq:
-                    safe_seq = self._extract_key_from_path(pth, seq_map)
-                safe_group = to_safe_name(group_val) if group_val else self._extract_safe_group_from_path(pth)
-                if not self._is_scope_allowed(group_val, seq_val, safe_seq, safe_group):
-                    continue
-                key = safe_seq
-                arr = self._load_one_general(pth, load_spec)
-                if arr is None or arr.size == 0:
-                    continue
-                if key not in per_key_parts:
-                    per_key_parts[key] = []
-                per_key_parts[key].append(arr)
-        return per_key_parts
+        self._allowed_safe_sequences: Optional[set[str]] = None
 
     def set_scope_constraints(self, scope: Optional[dict]) -> None:
         """
-        Capture dataset-level group/sequence filters so assignment can respect them.
+        Capture dataset-level sequence filters so assignment can respect them.
         """
         if not scope:
-            self._scope_constraints = None
+            self._allowed_safe_sequences = None
             return
-
-        def _to_norm_set(values: Any) -> Optional[set[str]]:
-            if not values:
-                return None
-            out = {str(v) for v in values if isinstance(v, (str, int)) or v}
-            out = {v for v in out if v}
-            return out or None
-
-        groups = _to_norm_set(scope.get("groups"))
-        safe_groups = _to_norm_set(scope.get("safe_groups"))
-        if groups and not safe_groups:
-            safe_groups = {to_safe_name(g) for g in groups}
-
-        sequences = _to_norm_set(scope.get("sequences"))
-        safe_sequences = _to_norm_set(scope.get("safe_sequences"))
-        if sequences and not safe_sequences:
-            safe_sequences = {to_safe_name(s) for s in sequences}
-
-        scoped = {
-            k: v for k, v in {
-                "groups": groups,
-                "safe_groups": safe_groups,
-                "sequences": sequences,
-                "safe_sequences": safe_sequences,
-            }.items() if v
-        }
-        self._scope_constraints = scoped or None
-
-    def _feature_path_metadata(self, feature_name: str, run_id: str) -> dict[Path, dict[str, str]]:
-        """
-        Returns {abs_path -> {group, sequence, sequence_safe}} for a prior feature run.
-        """
-        mapping: dict[Path, dict[str, str]] = {}
-        if self._ds is None:
-            return mapping
-        try:
-            idx_path = _feature_index_path(self._ds, feature_name)
-        except Exception:
-            return mapping
-        if not idx_path.exists():
-            return mapping
-        try:
-            df = pd.read_csv(idx_path)
-        except Exception:
-            return mapping
-        df = df[df["run_id"].astype(str) == str(run_id)]
-        if df.empty:
-            return mapping
-        df["group"] = df["group"].fillna("").astype(str)
-        df["sequence"] = df["sequence"].fillna("").astype(str)
-        if "sequence_safe" not in df.columns:
-            df["sequence_safe"] = df["sequence"].apply(lambda v: to_safe_name(v) if v else "")
-
-        for _, row in df.iterrows():
-            abs_raw = row.get("abs_path")
-            if not isinstance(abs_raw, str) or not abs_raw:
-                continue
-            try:
-                abs_path = Path(abs_raw).resolve()
-            except Exception:
-                abs_path = Path(abs_raw)
-            mapping[abs_path] = {
-                "group": str(row.get("group", "") or ""),
-                "sequence": str(row.get("sequence", "") or ""),
-                "sequence_safe": str(row.get("sequence_safe", "") or ""),
-            }
-        return mapping
-
-    def _extract_safe_group_from_path(self, path: Path) -> str:
-        stem = path.stem
-        if "__" in stem:
-            return stem.split("__", 1)[0]
-        return ""
-
-    def _is_scope_allowed(self,
-                          group: str,
-                          sequence: str,
-                          safe_sequence: str,
-                          safe_group: Optional[str]) -> bool:
-        if not self._scope_constraints:
-            return True
-        scope = self._scope_constraints
-        group = group or ""
-        sequence = sequence or ""
-        safe_sequence = safe_sequence or ""
-        safe_group = safe_group or ""
-        if scope.get("groups") and group not in scope["groups"]:
-            return False
-        if scope.get("safe_groups") and safe_group not in scope["safe_groups"]:
-            return False
-        if scope.get("sequences") and sequence not in scope["sequences"]:
-            return False
-        if scope.get("safe_sequences") and safe_sequence not in scope["safe_sequences"]:
-            return False
-        return True
+        safe_sequences = scope.get("safe_sequences")
+        if safe_sequences:
+            self._allowed_safe_sequences = {str(s) for s in safe_sequences}
+        else:
+            self._allowed_safe_sequences = None
 
     def _load_scaler(self, spec: dict):
         """
@@ -316,6 +153,7 @@ class GlobalKMeansClustering:
     # Dataset binding
     def needs_fit(self) -> bool: return True
     def supports_partial_fit(self) -> bool: return False
+    def loads_own_data(self) -> bool: return True  # Skip run_feature pre-loading; we load from artifacts
     def bind_dataset(self, ds): self._ds = ds
 
     # ----------------- Fit helpers -----------------
@@ -374,7 +212,14 @@ class GlobalKMeansClustering:
                     return pd.DataFrame()
                 df = df[use]
             else:
-                df = df.select_dtypes(include=["number"]) if numeric_only else df.apply(pd.to_numeric, errors="coerce")
+                if numeric_only:
+                    df = df.select_dtypes(include=["number"])
+                    # Drop metadata columns that are numeric but not features
+                    for mc in ("frame", "time", "id1", "id2"):
+                        if mc in df.columns:
+                            df = df.drop(columns=[mc])
+                else:
+                    df = df.apply(pd.to_numeric, errors="coerce")
             return df
 
         dfs = []
@@ -461,6 +306,9 @@ class GlobalKMeansClustering:
         # Optional: assign clusters to full-frame features using assign block
         assign = self.params.get("assign")
         if assign:
+            import gc
+            import pyarrow as pa
+
             # Optional scaler: if provided, standardize before prediction; else predict in raw space.
             scaler = None
             if "scaler" in assign and assign["scaler"]:
@@ -476,14 +324,19 @@ class GlobalKMeansClustering:
             )
             self._assign_inputs_meta = assign_inputs_meta
 
-            # Collect per-key inputs (may be empty)
-            per_key_parts = self._collect_inputs_per_key(resolved_assign_inputs)
-            for key, mats in per_key_parts.items():
-                if not mats:
+            # Use StreamingFeatureHelper for manifest building and data loading
+            helper = StreamingFeatureHelper(self._ds, "global-kmeans")
+            scope_filter = {"safe_sequences": self._allowed_safe_sequences} if self._allowed_safe_sequences else None
+            manifest = helper.build_manifest(resolved_assign_inputs, scope_filter=scope_filter)
+
+            # Process each sequence one at a time using direct loading
+            # (avoids generator pattern which holds extra reference to data)
+            keys = list(manifest.keys())
+            n_keys = len(keys)
+            for i, key in enumerate(keys):
+                X_full, _ = helper.load_key_data(manifest[key], extract_frames=False)
+                if X_full is None:
                     continue
-                T_min = min(m.shape[0] for m in mats)
-                mats_trim = [m[:T_min] for m in mats]
-                X_full = np.hstack(mats_trim)
                 D_total = X_full.shape[1]
 
                 if scaler is not None:
@@ -496,6 +349,7 @@ class GlobalKMeansClustering:
                             f"got {D_total} columns for key={key}"
                         )
                     X_use = scaler.transform(X_full)
+                    del X_full  # free raw data immediately
                 else:
                     # No scaler: require that assign inputs match the KMeans fit dimensionality.
                     if self._fit_dim is None:
@@ -506,9 +360,19 @@ class GlobalKMeansClustering:
                             f"but got {D_total} for key={key}. Provide a scaler or align inputs."
                         )
                     X_use = X_full
+                    # Note: X_use IS X_full here, so don't delete
 
                 labels = self._kmeans.predict(X_use)
                 self._assign_labels[key] = labels.astype(np.int32)
+
+                # Free memory after each sequence
+                del X_use, labels
+                gc.collect()
+                pa.default_memory_pool().release_unused()
+
+                if (i + 1) % 10 == 0 or i == n_keys - 1:
+                    print(f"[global-kmeans] Processed {i + 1}/{n_keys} sequences", file=sys.stderr)
+
             if self._fit_artifact_info is None:
                 self._fit_artifact_info = {}
             self._fit_artifact_info["assign_inputs_meta"] = assign_inputs_meta
@@ -536,6 +400,10 @@ class GlobalKMeansClustering:
         else:
             # Case 2: generic numeric-only fallback requiring same dimensionality
             num = X.select_dtypes(include=["number"])
+            # Drop metadata columns that are numeric but not features
+            for mc in ("frame", "time", "id1", "id2"):
+                if mc in num.columns:
+                    num = num.drop(columns=[mc])
             if num.shape[1] != self._fit_dim:
                 return pd.DataFrame(columns=["frame", "cluster"])  # silently skip
             A = num.to_numpy(dtype=np.float32, copy=False)

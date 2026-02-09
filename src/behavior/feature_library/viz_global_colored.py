@@ -104,6 +104,7 @@ class VizGlobalColored:
 
     def needs_fit(self): return True
     def supports_partial_fit(self): return False
+    def loads_own_data(self): return True  # Skip run_feature pre-loading; we load from artifacts
     def partial_fit(self, X): raise NotImplementedError
     def finalize_fit(self): pass
 
@@ -145,6 +146,10 @@ class VizGlobalColored:
                 df = df[use]
             elif load_spec.get("numeric_only", True):
                 df = df.select_dtypes(include=[np.number])
+                # Drop metadata columns that are numeric but not features
+                for mc in ("frame", "time", "id1", "id2"):
+                    if mc in df.columns:
+                        df = df.drop(columns=[mc])
             else:
                 # coerce everything numeric-style to avoid object columns
                 df = df.apply(pd.to_numeric, errors="coerce")

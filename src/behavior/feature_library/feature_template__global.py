@@ -142,7 +142,7 @@ class MyGlobalFeature:
                 safe_seq = seq_map.get(fp.resolve()) or to_safe_name(fp.stem)
                 if allowed_safe is not None and safe_seq not in allowed_safe:
                     continue
-                arr = _load_array_from_spec(fp, load_spec)
+                arr, _ = _load_array_from_spec(fp, load_spec)
                 if arr is None or arr.size == 0:
                     continue
                 per_key_parts.setdefault(safe_seq, []).append(arr)

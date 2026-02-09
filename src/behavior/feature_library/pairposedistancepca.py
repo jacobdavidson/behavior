@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import combinations
 from pathlib import Path
 from typing import Optional, Dict, Any, Iterable, List, Tuple
 
@@ -27,6 +28,7 @@ class PairPoseDistancePCA:
 
     _defaults = dict(
         pose_n=7,
+        pose_indices=None,  # list of pose point indices to use, or None for all 0..pose_n-1
         x_prefix="poseX",
         y_prefix="poseY",
         id_col="id",
@@ -86,6 +88,10 @@ class PairPoseDistancePCA:
             if "time" in meta_frames:
                 out["time"] = meta_frames["time"]
             out["perspective"] = meta_persp
+            if "id1" in meta_frames:
+                out["id1"] = meta_frames["id1"]
+            if "id2" in meta_frames:
+                out["id2"] = meta_frames["id2"]
             for col in (self.params["seq_col"], self.params["group_col"]):
                 if col in df.columns:
                     out[col] = df[col].iloc[0]
@@ -95,10 +101,15 @@ class PairPoseDistancePCA:
             return pd.DataFrame(columns=["perspective"] + [f"PC{i}" for i in range(self.params["n_components"])])
 
         out_df = pd.concat(pcs, ignore_index=True)
+        sort_keys = []
+        if "id1" in out_df.columns:
+            sort_keys += ["id1", "id2"]
+        sort_keys.append("perspective")
         if "frame" in out_df.columns:
-            out_df = out_df.sort_values(["perspective", "frame"]).reset_index(drop=True)
+            sort_keys.append("frame")
         elif "time" in out_df.columns:
-            out_df = out_df.sort_values(["perspective", "time"]).reset_index(drop=True)
+            sort_keys.append("time")
+        out_df = out_df.sort_values(sort_keys).reset_index(drop=True)
         return out_df
 
     def save_model(self, path: Path) -> None:
@@ -123,10 +134,21 @@ class PairPoseDistancePCA:
         self._fitted = True
 
     # ---------- Internals ----------
+    def _get_pose_indices(self) -> List[int]:
+        """Return the list of pose point indices to use."""
+        indices = self.params.get("pose_indices")
+        if indices is None:
+            return list(range(int(self.params["pose_n"])))
+        return list(indices)
+
+    def _effective_pose_n(self) -> int:
+        """Return the number of pose points being used."""
+        return len(self._get_pose_indices())
+
     def _column_names(self) -> Tuple[List[str], List[str]]:
-        N = int(self.params["pose_n"])
-        xs = [f"{self.params['x_prefix']}{i}" for i in range(N)]
-        ys = [f"{self.params['y_prefix']}{i}" for i in range(N)]
+        indices = self._get_pose_indices()
+        xs = [f"{self.params['x_prefix']}{i}" for i in indices]
+        ys = [f"{self.params['y_prefix']}{i}" for i in indices]
         return xs, ys
 
     def _order_col(self, df: pd.DataFrame) -> str:
@@ -189,14 +211,14 @@ class PairPoseDistancePCA:
             ids = sorted(gseq[self.params["id_col"]].unique())
             if len(ids) < 2:
                 continue
-            idA, idB = ids[:2]
-            pairs.append((seq, idA, idB))
+            for idA, idB in combinations(ids, 2):
+                pairs.append((seq, idA, idB))
 
         if not pairs:
             raise ValueError("[pair-posedistance-pca] No sequence with at least two IDs found.")
 
         if self._tri_i is None or self._tri_j is None or self._feat_len is None:
-            N = int(self.params["pose_n"])
+            N = self._effective_pose_n()
             tri_i, tri_j = np.tril_indices(N, k=-1)
             n_intra = len(tri_i)
             n_cross = N * N
@@ -250,9 +272,11 @@ class PairPoseDistancePCA:
                 X = np.vstack(feats).astype(np.float32, copy=False)
 
                 persp = np.zeros(X.shape[0], dtype=np.int8)
-                frames_meta: Dict[str, np.ndarray] = {}
+                frames_meta: Dict[str, Any] = {}
                 if "frame" in df.columns:
                     frames_meta["frame"] = chunk[order_col].to_numpy()
+                frames_meta["id1"] = idA
+                frames_meta["id2"] = idB
 
                 if dup:
                     feats2 = [self._build_pair_feat(b, a) for a, b in zip(XA, XB)]
@@ -268,7 +292,7 @@ class PairPoseDistancePCA:
                 yield X, frames_meta, persp
 
     def _pose_to_points(self, row_vals: np.ndarray) -> np.ndarray:
-        N = int(self.params["pose_n"])
+        N = self._effective_pose_n()
         xs = row_vals[:N]; ys = row_vals[N:]
         return np.stack([xs, ys], axis=1)
 

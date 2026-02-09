@@ -82,7 +82,8 @@ class PairWavelet:
         # 3) Auto-detect: all numeric columns except known meta
         meta_like = {self.params.get("seq_col", "sequence"),
                      self.params.get("group_col", "group"),
-                     "frame", "time", "perspective", "id", "fps"}
+                     "frame", "time", "perspective", "id", "fps",
+                     "id1", "id2"}
         num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in meta_like]
         if not num_cols:
             raise ValueError("[pair-wavelet] Could not auto-detect numeric feature columns.")
@@ -118,9 +119,18 @@ class PairWavelet:
         # prepare wavelet frequencies/scales
         self._prepare_band(fps)
 
-        # compute per perspective block (keeps ordering stable)
+        # compute per (id1, id2, perspective) block — or just perspective if no pair IDs
+        has_pair_ids = "id1" in df.columns and "id2" in df.columns
+        group_keys = ["id1", "id2", "perspective"] if has_pair_ids else ["perspective"]
+
         out_blocks: List[pd.DataFrame] = []
-        for persp, g in df.groupby("perspective"):
+        for group_vals, g in df.groupby(group_keys):
+            if has_pair_ids:
+                cur_id1, cur_id2, persp = group_vals
+            else:
+                persp = group_vals if not isinstance(group_vals, tuple) else group_vals[0]
+                cur_id1 = cur_id2 = None
+
             g = g.sort_values(order_col)
             Z = g[in_cols].to_numpy(dtype=float)  # shape (T, k)
             T, k = Z.shape
@@ -155,6 +165,11 @@ class PairWavelet:
             block[order_col] = g[order_col].to_numpy()
             block["perspective"] = int(persp)
 
+            # passthrough pair IDs
+            if cur_id1 is not None:
+                block["id1"] = cur_id1
+                block["id2"] = cur_id2
+
             # optional passthrough
             for col in (p["seq_col"], p["group_col"]):
                 if col in df.columns:
@@ -166,7 +181,11 @@ class PairWavelet:
             return pd.DataFrame(columns=[order_col, "perspective"])
 
         out = pd.concat(out_blocks, ignore_index=True)
-        out = out.sort_values(["perspective", order_col]).reset_index(drop=True)
+        sort_keys = []
+        if "id1" in out.columns:
+            sort_keys += ["id1", "id2"]
+        sort_keys += ["perspective", order_col]
+        out = out.sort_values(sort_keys).reset_index(drop=True)
 
         # Attach JSON-serializable metadata only (so parquet writers won't error)
         try:

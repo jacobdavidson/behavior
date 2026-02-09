@@ -30,7 +30,7 @@ from behavior.dataset import (
     _resolve_inputs,
     _yield_feature_frames,
 )
-from behavior.helpers import to_safe_name
+from behavior.helpers import to_safe_name, load_labels_for_feature_frames
 from .helpers import XGB_PARAM_PRESETS, to_jsonable, undersample_then_smote
 
 
@@ -359,12 +359,37 @@ class BehaviorXGBoostModel:
             label_info = label_lookup.get(safe_seq)
             if not label_info:
                 continue
-            labels = self._load_labels(label_info["path"])
-            n = min(len(labels), feat_data["features"].shape[0])
-            if n <= 0:
+            label_path = label_info["path"]
+            frame_indices = feat_data.get("frame_indices")
+            pair_ids = feat_data.get("pair_ids")  # (N, 2) array or None
+
+            if pair_ids is not None and frame_indices is not None:
+                # Pair-aware alignment: look up labels per (frame, id1, id2)
+                labels = self._align_labels_pair_aware(
+                    label_path, frame_indices, pair_ids
+                )
+            elif frame_indices is not None:
+                # Frame-aware alignment (no pair info): use load_labels_for_feature_frames
+                labels = load_labels_for_feature_frames(
+                    label_path, frame_indices, default_label=0,
+                    deduplicate_symmetric=True,
+                )
+            else:
+                # Fallback: dense label array, assume row i == frame i
+                dense = self._load_labels(label_path)
+                n = min(len(dense), feat_data["features"].shape[0])
+                if n <= 0:
+                    continue
+                labels = dense[:n]
+                feat_data["features"] = feat_data["features"][:n]
+
+            features = feat_data["features"]
+            if len(labels) != features.shape[0]:
+                n = min(len(labels), features.shape[0])
+                features = features[:n]
+                labels = labels[:n]
+            if features.shape[0] == 0:
                 continue
-            features = feat_data["features"][:n]
-            labels = labels[:n]
             mask = np.isfinite(features).all(axis=1)
             if not mask.any():
                 continue
@@ -385,6 +410,52 @@ class BehaviorXGBoostModel:
         if self._feature_columns is None and payloads:
             self._feature_columns = [f"f{i}" for i in range(payloads[0]["features"].shape[1])]
         return payloads
+
+    def _align_labels_pair_aware(
+        self,
+        label_path: Path,
+        frame_indices: np.ndarray,
+        pair_ids: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Pair-aware label alignment: for each feature row, look up the label
+        matching its specific (frame, id1, id2) triple.
+
+        Loads sparse labels once, builds a {(frame, id1, id2) -> label} dict,
+        then does a vectorised lookup for every feature row.
+        """
+        from behavior.helpers import detect_label_format
+
+        with np.load(label_path, allow_pickle=True) as npz:
+            fmt = detect_label_format(npz)
+            if fmt == "individual_pair_v1":
+                lbl_frames = np.asarray(npz["frames"], dtype=np.int64).ravel()
+                lbl_labels = np.asarray(npz["labels"], dtype=np.int64).ravel()
+                lbl_ids = np.asarray(npz["individual_ids"])
+                if lbl_ids.ndim == 1:
+                    lbl_ids = lbl_ids.reshape(-1, 2)
+
+                # Build lookup: (frame, min_id, max_id) -> label
+                # Normalise pair order so (a,b) and (b,a) both match
+                lookup: dict[tuple, int] = {}
+                for f, lbl, (a, b) in zip(lbl_frames, lbl_labels, lbl_ids):
+                    key = (int(f), min(int(a), int(b)), max(int(a), int(b)))
+                    # Keep the highest label when duplicates exist
+                    if key not in lookup or int(lbl) > lookup[key]:
+                        lookup[key] = int(lbl)
+
+                # Lookup per feature row
+                result = np.zeros(len(frame_indices), dtype=np.int64)
+                for i, (fr, (id1, id2)) in enumerate(zip(frame_indices, pair_ids)):
+                    key = (int(fr), min(int(id1), int(id2)), max(int(id1), int(id2)))
+                    result[i] = lookup.get(key, 0)
+                return result
+            else:
+                # Dense or unknown format — fall back to frame-only alignment
+                return load_labels_for_feature_frames(
+                    label_path, frame_indices, default_label=0,
+                    deduplicate_symmetric=True,
+                )
 
     def _collect_single_feature(self, ds, cfg: dict) -> Dict[str, dict]:
         feature = cfg["feature"]
@@ -414,7 +485,7 @@ class BehaviorXGBoostModel:
             abs_path = ds.remap_path(abs_raw)
             if not abs_path.exists():
                 continue
-            features, cols = self._load_feature_matrix(abs_path, loader)
+            features, cols, frame_indices, pair_ids = self._load_feature_matrix(abs_path, loader)
             if features.size == 0:
                 continue
             if feature_columns is None:
@@ -426,6 +497,8 @@ class BehaviorXGBoostModel:
                 "features": features.astype(np.float32, copy=False),
                 "sequence": row.get("sequence", ""),
                 "group": row.get("group", ""),
+                "frame_indices": frame_indices,
+                "pair_ids": pair_ids,
             }
         if not payloads:
             raise RuntimeError("No sequences had usable feature outputs.")
@@ -473,7 +546,7 @@ class BehaviorXGBoostModel:
                 except Exception:
                     resolved = pth
                 safe_seq = seq_map.get(resolved) or to_safe_name(pth.stem)
-                arr, cols = self._load_feature_matrix(resolved, load_spec)
+                arr, cols, frame_indices, pair_ids = self._load_feature_matrix(resolved, load_spec)
                 if arr is None or arr.size == 0:
                     continue
                 if columns_by_input[idx] is None:
@@ -492,6 +565,10 @@ class BehaviorXGBoostModel:
                     },
                 )
                 entry["mats"][idx] = arr
+                if frame_indices is not None and "frame_indices" not in entry:
+                    entry["frame_indices"] = frame_indices
+                if pair_ids is not None and "pair_ids" not in entry:
+                    entry["pair_ids"] = pair_ids
 
         feature_payloads: Dict[str, dict] = {}
         first_columns: Optional[List[str]] = None
@@ -516,10 +593,18 @@ class BehaviorXGBoostModel:
                         cols = self._derive_columns_from_loader(spec.get("load") or {}, mat.shape[1], prefix=prefix)
                     col_names.extend(cols)
                 first_columns = col_names
+            fi = bundle.get("frame_indices")
+            if fi is not None:
+                fi = fi[:T_min]
+            pi = bundle.get("pair_ids")
+            if pi is not None:
+                pi = pi[:T_min]
             feature_payloads[safe_seq] = {
                 "features": features,
                 "sequence": bundle.get("sequence"),
                 "group": bundle.get("group"),
+                "frame_indices": fi,
+                "pair_ids": pi,
             }
 
         if first_columns is not None:
@@ -548,10 +633,27 @@ class BehaviorXGBoostModel:
                 return [f"{prefix}{c}" for c in cols]
         return [f"{prefix}f{i}" for i in range(width)]
 
-    def _load_feature_matrix(self, path: Path, loader: dict) -> tuple[np.ndarray, Optional[List[str]]]:
+    def _load_feature_matrix(self, path: Path, loader: dict) -> tuple[np.ndarray, Optional[List[str]], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Returns (features, column_names, frame_indices_or_None, pair_ids_or_None).
+
+        pair_ids is a (N, 2) int32 array of per-row [id1, id2] or None.
+        """
         kind = str(loader.get("kind", "parquet")).lower()
         if kind == "parquet":
             df = pd.read_parquet(path)
+            # Extract frame column for label alignment before filtering
+            frame_indices = None
+            if "frame" in df.columns:
+                frame_indices = df["frame"].to_numpy(dtype=np.int32)
+                df = df.drop(columns=["frame"])
+            # Extract pair ID columns
+            pair_ids = None
+            if "id1" in df.columns and "id2" in df.columns:
+                pair_ids = np.column_stack([
+                    df["id1"].to_numpy(dtype=np.int32),
+                    df["id2"].to_numpy(dtype=np.int32),
+                ])
+                df = df.drop(columns=["id1", "id2"])
             drop_cols = loader.get("drop_columns")
             if drop_cols:
                 df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
@@ -562,7 +664,7 @@ class BehaviorXGBoostModel:
                 df = df.select_dtypes(include=[np.number])
             else:
                 df = df.apply(pd.to_numeric, errors="coerce")
-            return df.to_numpy(dtype=np.float32, copy=False), list(df.columns)
+            return df.to_numpy(dtype=np.float32, copy=False), list(df.columns), frame_indices, pair_ids
         if kind == "npz":
             key = loader.get("key")
             if not key:
@@ -575,7 +677,7 @@ class BehaviorXGBoostModel:
                 arr = arr.T
             if arr.ndim == 1:
                 arr = arr[:, None]
-            return arr.astype(np.float32, copy=False), None
+            return arr.astype(np.float32, copy=False), None, None, None
         raise ValueError(f"Unsupported feature_loader.kind='{kind}'")
 
     def _load_labels(self, path: Path) -> np.ndarray:

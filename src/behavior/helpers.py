@@ -230,6 +230,7 @@ def load_labels_for_feature_frames(
     feature_frames: np.ndarray,
     default_label: int = 0,
     deduplicate_symmetric: bool = True,
+    individual_filter: Optional[Tuple[int, int]] = None,
 ) -> np.ndarray:
     """
     Load labels from NPZ file and align to specific feature frame indices.
@@ -252,6 +253,11 @@ def load_labels_for_feature_frames(
     deduplicate_symmetric : bool, default=True
         For individual_pair_v1 format with symmetric storage (both [i,j] and
         [j,i] stored), deduplicate by keeping only id1 <= id2 events.
+        Ignored when individual_filter is set (filtering is more specific).
+    individual_filter : tuple of (int, int), optional
+        For individual_pair_v1 format, only include events matching this
+        specific (id1, id2) pair. When set, deduplicate_symmetric is skipped
+        since the filter is already pair-specific.
 
     Returns
     -------
@@ -293,8 +299,16 @@ def load_labels_for_feature_frames(
             if individual_ids.ndim == 1:
                 individual_ids = individual_ids.reshape(-1, 2)
 
-            # Deduplicate symmetric pairs if requested
-            if deduplicate_symmetric:
+            if individual_filter is not None:
+                # Filter to specific pair — check both orderings for symmetric labels
+                id1, id2 = individual_filter
+                mask_fwd = (individual_ids[:, 0] == id1) & (individual_ids[:, 1] == id2)
+                mask_rev = (individual_ids[:, 0] == id2) & (individual_ids[:, 1] == id1)
+                mask = mask_fwd | mask_rev
+                frames = frames[mask]
+                labels = labels[mask]
+            elif deduplicate_symmetric:
+                # Deduplicate symmetric pairs if requested
                 mask = individual_ids[:, 0] <= individual_ids[:, 1]
                 frames = frames[mask]
                 labels = labels[mask]

@@ -3473,15 +3473,21 @@ def _append_feature_index(idx_path: Path, rows: list[dict]):
 def _process_transform_worker(payload):
     """
     Helper for process-based feature transforms.
-    payload: (module, cls_name, params, df, extra_attrs)
+    payload: (module, cls_name, params, df, extra_attrs, model_path)
     """
-    module, cls_name, params, df, extra_attrs = payload
+    module, cls_name, params, df, extra_attrs, model_path = payload
     mod = importlib.import_module(module)
     cls = getattr(mod, cls_name)
     feat = cls(params)
     for name, val in (extra_attrs or {}).items():
         try:
             setattr(feat, name, val)
+        except Exception:
+            pass
+    # Load fitted model if available
+    if model_path and hasattr(feat, "load_model"):
+        try:
+            feat.load_model(Path(model_path))
         except Exception:
             pass
     return feat.transform(df)
@@ -4348,7 +4354,24 @@ def run_feature(self,
             return item[2]  # (g, s, df)
 
     if feature.needs_fit():
-        if feature.supports_partial_fit():
+        # Pass run_root to feature if it supports it (for streaming writes during fit)
+        if hasattr(feature, "set_run_root"):
+            try:
+                feature.set_run_root(run_root)
+            except Exception as e:
+                print(f"[feature:{feature.name}] set_run_root failed: {e}", file=sys.stderr)
+
+        # Check if fit phase can be skipped (for global features with existing outputs)
+        loads_own = getattr(feature, "loads_own_data", lambda: False)()
+        model_path = run_root / "model.joblib"
+        # Also check for global-specific artifacts (e.g., global_opentsne_embedding.joblib)
+        embedding_path = run_root / "global_opentsne_embedding.joblib"
+        fit_complete = model_path.exists() or embedding_path.exists()
+
+        skip_fit = not overwrite and loads_own and fit_complete
+        if skip_fit:
+            print(f"[feature:{feature.name}] fit phase skipped (overwrite=False, outputs exist)", file=sys.stderr)
+        elif feature.supports_partial_fit():
             for item in iter_inputs():
                 df = _extract_df_from_item(item)
                 try:
@@ -4360,10 +4383,15 @@ def run_feature(self,
             except Exception:
                 pass
         else:
-            all_dfs = []
-            for item in iter_inputs():
-                df = _extract_df_from_item(item)
-                all_dfs.append(df)
+            # Check if feature loads its own data (e.g., GlobalTSNE) - avoid pre-loading
+            if loads_own:
+                # Feature will load data itself; pass empty iterator to satisfy protocol
+                all_dfs = []
+            else:
+                all_dfs = []
+                for item in iter_inputs():
+                    df = _extract_df_from_item(item)
+                    all_dfs.append(df)
             # Always call fit, even if no streamed inputs were found.
             # Many "global/artifact" features load their own matrices from disk.
             try:
@@ -4375,13 +4403,13 @@ def run_feature(self,
                 except Exception as e:
                     print(f"[feature:{feature.name}] fit() failed: {e}", file=sys.stderr)
 
-        # Save model state if any
-        model_path = run_root / "model.joblib"
-        try:
-            feature.save_model(model_path)
-        except NotImplementedError:
-            # Feature doesn't implement save_model() - this is optional, so just skip
-            pass
+        # Save model state if any (only if fit was actually run)
+        if not skip_fit:
+            try:
+                feature.save_model(model_path)
+            except NotImplementedError:
+                # Feature doesn't implement save_model() - this is optional, so just skip
+                pass
 
     # ===== TRANSFORM PHASE =====
     out_rows = list(preexisting_rows) if preexisting_rows else []
@@ -4462,19 +4490,31 @@ def run_feature(self,
         sequence = payload.get("sequence", "")
         group = payload.get("group")
         chunk_iter = payload["parquet_chunk_iter"]
+        pair_ids = payload.get("pair_ids")  # scalar (id1, id2) tuple or None
         schema_fields = [("frame", pa.int32())]
         schema_fields.extend([(name, pa.float32()) for name in columns])
+        if pair_ids is not None:
+            schema_fields.append(("id1", pa.int32()))
+            schema_fields.append(("id2", pa.int32()))
         schema_fields.append(("sequence", pa.string()))
         if group:
             schema_fields.append(("group", pa.string()))
         schema = pa.schema(schema_fields)
         writer = pq.ParquetWriter(meta["out_path"], schema, compression="snappy")
         total_rows = 0
+        source_frame_indices = payload.get("frame_indices")
         for start, chunk in chunk_iter:
             chunk_len = chunk.shape[0]
-            arrays = {"frame": pa.array(np.arange(start, start + chunk_len, dtype=np.int32))}
+            if source_frame_indices is not None:
+                frame_arr = source_frame_indices[start:start + chunk_len]
+            else:
+                frame_arr = np.arange(start, start + chunk_len, dtype=np.int32)
+            arrays = {"frame": pa.array(frame_arr)}
             for idx, name in enumerate(columns):
                 arrays[name] = pa.array(chunk[:, idx])
+            if pair_ids is not None:
+                arrays["id1"] = pa.array(np.full(chunk_len, pair_ids[0], dtype=np.int32))
+                arrays["id2"] = pa.array(np.full(chunk_len, pair_ids[1], dtype=np.int32))
             arrays["sequence"] = pa.array([sequence] * chunk_len)
             if group:
                 arrays["group"] = pa.array([group] * chunk_len)
@@ -4503,7 +4543,15 @@ def run_feature(self,
             seq = df_feat.get("sequence")
             group = df_feat.get("group")
             df_out = pd.DataFrame(data, columns=columns)
-            df_out.insert(0, "frame", np.arange(df_out.shape[0], dtype=np.int32))
+            fi = df_feat.get("frame_indices")
+            if fi is not None and len(fi) == df_out.shape[0]:
+                df_out.insert(0, "frame", fi.astype(np.int32))
+            else:
+                df_out.insert(0, "frame", np.arange(df_out.shape[0], dtype=np.int32))
+            ppr = df_feat.get("pair_ids_per_row")
+            if ppr is not None and len(ppr) == df_out.shape[0]:
+                df_out["id1"] = ppr[:, 0].astype(np.int32)
+                df_out["id2"] = ppr[:, 1].astype(np.int32)
             if seq is not None and "sequence" not in df_out.columns:
                 df_out["sequence"] = seq
             if group is not None and "group" not in df_out.columns:
@@ -4591,7 +4639,9 @@ def run_feature(self,
 
         if executor:
             if parallel_mode == "process":
-                payload = (feature.__module__, feature.__class__.__name__, getattr(feature, "params", {}), df, extra_attrs)
+                model_path = run_root / "model.joblib"
+                model_path_str = str(model_path) if model_path.exists() else None
+                payload = (feature.__module__, feature.__class__.__name__, getattr(feature, "params", {}), df, extra_attrs, model_path_str)
                 futures[executor.submit(_process_transform_worker, payload)] = (meta, core_start, core_end)
             else:
                 futures[executor.submit(feature.transform, df)] = (meta, core_start, core_end)

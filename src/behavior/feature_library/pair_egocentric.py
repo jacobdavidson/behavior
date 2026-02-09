@@ -5,6 +5,7 @@ Extracted from features.py as part of feature_library modularization.
 """
 
 from __future__ import annotations
+from itertools import combinations
 from typing import Optional, Dict, Any, Iterable, List, Tuple
 
 import numpy as np
@@ -21,12 +22,13 @@ class PairEgocentricFeatures:
     Produces a row-wise DataFrame with columns:
       - frame (if available) or time passthrough (only if it's the order col)
       - perspective: 0 for A→B, 1 for B→A
+      - id1, id2: pair identifiers
       - feature columns (e.g., A_speed, AB_dx_egoA, ...)
       - (optionally) group/sequence if present in df, for convenience
 
-    This feature is *stateless* (no fitting). It infers per-sequence dyads by taking
-    the first two IDs present in each sequence, cleans/interpolates pose per animal,
-    inner-joins by the chosen order column, and computes A→B and B→A features.
+    This feature is *stateless* (no fitting). It computes features for all C(n,2)
+    pairs per sequence, cleans/interpolates pose per animal, inner-joins by the
+    chosen order column, and computes A→B and B→A features for each pair.
     """
 
     name    = "pair-egocentric"
@@ -37,6 +39,7 @@ class PairEgocentricFeatures:
     _defaults = dict(
         # pose / columns
         pose_n=7,
+        pose_indices=None,  # list of pose point indices to use, or None for all 0..pose_n-1
         x_prefix="poseX", y_prefix="poseY",   # TRex-ish
         id_col="id",
         seq_col="sequence",
@@ -110,12 +113,13 @@ class PairEgocentricFeatures:
             .apply(wrapped_func, include_groups=False)
         )
 
-        # Build dyads (first two IDs per sequence)
+        # Build dyads (all C(n,2) pairs per sequence)
         pairs = []
         for seq, gseq in df_small.groupby(p["seq_col"]):
             ids = sorted(gseq[p["id_col"]].unique())
             if len(ids) >= 2:
-                pairs.append((seq, ids[0], ids[1]))
+                for idA, idB in combinations(ids, 2):
+                    pairs.append((seq, idA, idB))
 
         if not pairs:
             raise ValueError("[pair-egocentric] No sequence with at least two IDs found.")
@@ -150,10 +154,14 @@ class PairEgocentricFeatures:
             dfA = pd.DataFrame(AtoB.T, columns=names)
             dfA["frame"] = frames
             dfA["perspective"] = 0
+            dfA["id1"] = idA
+            dfA["id2"] = idB
 
             dfB = pd.DataFrame(BtoA.T, columns=names)
             dfB["frame"] = frames
             dfB["perspective"] = 1
+            dfB["id1"] = idB
+            dfB["id2"] = idA
 
             # optional pass-through for convenience (constant per call)
             for col in (p["seq_col"], p["group_col"]):
@@ -164,17 +172,47 @@ class PairEgocentricFeatures:
             out_frames.extend([dfA, dfB])
 
         if not out_frames:
-            return pd.DataFrame(columns=["perspective", "frame"])
+            return pd.DataFrame(columns=["perspective", "frame", "id1", "id2"])
 
         out = pd.concat(out_frames, ignore_index=True)
-        out = out.sort_values(["perspective", "frame"]).reset_index(drop=True)
+        out = out.sort_values(["frame", "id1", "id2"]).reset_index(drop=True)
         return out
 
     # ------------- Internals -------------
+    def _get_pose_indices(self) -> List[int]:
+        """Return the list of pose point indices to use."""
+        indices = self.params.get("pose_indices")
+        if indices is None:
+            return list(range(int(self.params["pose_n"])))
+        return list(indices)
+
+    def _effective_pose_n(self) -> int:
+        """Return the number of pose points being used."""
+        return len(self._get_pose_indices())
+
+    def _map_anatomical_idx(self, param_name: str) -> int:
+        """Map an anatomical index (neck_idx, tail_base_idx) to position in filtered array.
+
+        If pose_indices is set, the param value is treated as an absolute pose point index
+        and mapped to its position in pose_indices. If pose_indices is None, returns the
+        value directly as an index into the full array.
+        """
+        val = int(self.params[param_name])
+        indices = self.params.get("pose_indices")
+        if indices is None:
+            return val
+        try:
+            return list(indices).index(val)
+        except ValueError:
+            raise ValueError(
+                f"[pair-egocentric] {param_name}={val} is not in pose_indices={indices}. "
+                f"When using pose_indices, {param_name} must be one of the selected indices."
+            )
+
     def _column_names(self) -> Tuple[List[str], List[str]]:
-        N = int(self.params["pose_n"])
-        xs = [f"{self.params['x_prefix']}{i}" for i in range(N)]
-        ys = [f"{self.params['y_prefix']}{i}" for i in range(N)]
+        indices = self._get_pose_indices()
+        xs = [f"{self.params['x_prefix']}{i}" for i in indices]
+        ys = [f"{self.params['y_prefix']}{i}" for i in indices]
         return xs, ys
 
     def _order_col(self, df: pd.DataFrame) -> str:
@@ -227,16 +265,17 @@ class PairEgocentricFeatures:
         return xs.mean(axis=1), ys.mean(axis=1)
 
     def _build_ego_block_for_joined(self, j: pd.DataFrame, fps: float, pose_cols: List[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
-        N = int(self.params["pose_n"])
-        neck = int(self.params["neck_idx"])
-        tail = int(self.params["tail_base_idx"])
+        indices = self._get_pose_indices()
+        N = len(indices)
+        neck = self._map_anatomical_idx("neck_idx")
+        tail = self._map_anatomical_idx("tail_base_idx")
         win  = int(self.params["smooth_win"])
         mode = self.params["center_mode"]
 
-        XA = j[[f"{self.params['x_prefix']}{k}_A" for k in range(N)]].to_numpy()
-        YA = j[[f"{self.params['y_prefix']}{k}_A" for k in range(N)]].to_numpy()
-        XB = j[[f"{self.params['x_prefix']}{k}_B" for k in range(N)]].to_numpy()
-        YB = j[[f"{self.params['y_prefix']}{k}_B" for k in range(N)]].to_numpy()
+        XA = j[[f"{self.params['x_prefix']}{k}_A" for k in indices]].to_numpy()
+        YA = j[[f"{self.params['y_prefix']}{k}_A" for k in indices]].to_numpy()
+        XB = j[[f"{self.params['x_prefix']}{k}_B" for k in indices]].to_numpy()
+        YB = j[[f"{self.params['y_prefix']}{k}_B" for k in indices]].to_numpy()
         frames = j["frame"].to_numpy().astype(int)
 
         # optional smoothing

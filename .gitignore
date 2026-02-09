@@ -33,3 +33,5 @@ notebooks/trex-bees.ipynb
 /guppies
 behavior-guppies.code-workspace
 /src/behavior/__pycache__
+sync-to-remote.ipynb
+/src/behavior/__pycache__

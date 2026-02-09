@@ -79,6 +79,9 @@ class GlobalWardClustering:
     def supports_partial_fit(self) -> bool:
         return False
 
+    def loads_own_data(self) -> bool:
+        return True  # Skip run_feature pre-loading; we load from artifacts
+
     def fit(self, X_iter: Iterable[pd.DataFrame]) -> None:
         # Ignore X_iter; we load from the declared artifact to avoid accidental wrong inputs
         X = self._load_artifact_matrix()
@@ -226,7 +229,12 @@ class GlobalWardClustering:
                     A = df[cols].to_numpy(dtype=np.float32)
                 else:
                     if load_spec.get("numeric_only", True):
-                        A = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+                        df_num = df.select_dtypes(include=[np.number])
+                        # Drop metadata columns that are numeric but not features
+                        for mc in ("frame", "time", "id1", "id2"):
+                            if mc in df_num.columns:
+                                df_num = df_num.drop(columns=[mc])
+                        A = df_num.to_numpy(dtype=np.float32)
                     else:
                         A = df.to_numpy(dtype=np.float32)
             else:
